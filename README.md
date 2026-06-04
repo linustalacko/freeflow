@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zachlatta/freeflow/releases/latest/download/FreeFlow.dmg"><b>⬇ Download FreeFlow.dmg</b></a><br>
-  <sub>Works on all Macs (Apple Silicon + Intel)</sub>
+  <b>This fork is source-only — <a href="#build-from-source">build it from source</a> to get these changes.</b><br>
+  <sub>The prebuilt <a href="https://github.com/zachlatta/freeflow/releases/latest/download/FreeFlow.dmg">FreeFlow.dmg</a> is the original upstream app and does <b>not</b> include this fork's local-STT or overlay changes.</sub>
 </p>
 
 ---
@@ -42,16 +42,18 @@ FreeFlow is a free Mac dictation app inspired by [Wispr Flow](https://wisprflow.
 
 ## Quick Start
 
-1. Download the app from above or [click here](https://github.com/zachlatta/freeflow/releases/latest/download/FreeFlow.dmg)
-2. Get a free Groq API key from [groq.com](https://groq.com/)
-3. Hold `Fn` to talk, or tap `Command-Fn` to start and stop dictation, and have whatever you say pasted into the current text field
+1. [Build from source](#build-from-source) (this fork has no prebuilt release).
+2. Pick a speech-to-text backend:
+   - **Fully local / free** — follow [`local-setup/`](local-setup/) (`whisper.cpp` + Ollama). No API key required.
+   - **Hosted** — get a free [Groq](https://console.groq.com/) key (or any OpenAI-compatible provider) and set it in Settings.
+3. Hold `Fn` to talk, or tap `Command-Fn` to start and stop dictation, and have whatever you say pasted into the current text field. You can change the shortcut in Settings.
 
 ## Features
 
 - **Custom shortcuts:** Customize both hold-to-talk and toggle dictation shortcuts. If your toggle shortcut extends your hold shortcut, you can start in hold mode and press the extra modifier keys to latch into tap mode without stopping the recording.
 - **Context-aware cleanup:** FreeFlow can read nearby app context so names, terms, and phrases are spelled correctly when you dictate into email, terminals, docs, and other apps.
 - **Custom vocabulary:** Add names, jargon, and project-specific words that FreeFlow should preserve during cleanup.
-- **OpenAI-compatible providers:** Use Groq by default, or configure a custom model and API URL in settings.
+- **Local or hosted transcription:** Run it fully local with `whisper.cpp` + Ollama (see [`local-setup/`](local-setup/)), use Groq's free tier, or any other OpenAI-compatible provider — all configurable in settings.
 
 ## Edit Mode
 
@@ -59,7 +61,7 @@ Edit Mode lets you highlight existing text and transform it with a spoken instru
 
 ## Privacy
 
-There is no FreeFlow server, so FreeFlow does not store or retain your data. The only information that leaves your computer are API calls to your configured transcription and LLM provider.
+There is no FreeFlow server, so FreeFlow does not store or retain your data. With the [local setup](local-setup/), **transcription never leaves your machine** (only the cleanup step optionally calls Groq, or runs fully local too). Otherwise, the only information that leaves your computer are API calls to your configured transcription and LLM provider.
 
 ## Custom Cleanup
 
@@ -91,7 +93,11 @@ Then your response would be ONLY the cleaned up text, so here your response is O
 
 ## Using a Local Model
 
-FreeFlow can use OpenAI-compatible local or self-hosted providers instead of Groq. In settings, configure the API base URL and model IDs for your local LLM provider, such as Ollama, LM Studio, or another OpenAI-compatible server. If your transcription backend uses a different endpoint from your LLM backend, set the transcription API URL separately.
+This fork ships a complete local/hybrid pipeline in **[`local-setup/`](local-setup/)**: local `whisper.cpp` (Metal) transcription, plus a small router that uses Groq's free `gpt-oss-20b` when online and falls back to a local Ollama model when offline. Follow that README to set it up end to end.
+
+More generally, FreeFlow works with any OpenAI-compatible local or self-hosted provider (Ollama, LM Studio, etc.): in settings, configure the API base URL and model IDs, and set the transcription API URL separately if your STT backend differs from your LLM backend.
+
+> Models are read from `UserDefaults` (`defaults read com.zachlatta.freeflow.dev post_processing_model`, etc.), while the API URLs and keys live in the app's `.settings` file — keep that in mind if you're scripting the config.
 
 Local models are often slower than hosted providers, especially on cold start, long recordings, or busy hardware.
 
@@ -121,6 +127,24 @@ defaults delete com.zachlatta.freeflow context_request_timeout_seconds
 ```
 
 </details>
+
+## Build from source
+
+Requires the Xcode command-line tools (`swiftc`, `make`).
+
+```bash
+git clone https://github.com/linustalacko/freeflow.git
+cd freeflow
+make ARCH="$(uname -m)" CODESIGN_IDENTITY=-   # ad-hoc signed dev build
+open "build/FreeFlow Dev.app"
+```
+
+This produces `build/FreeFlow Dev.app`. On first launch, grant **Microphone**, **Accessibility**, and **Input Monitoring** (the global hotkey needs them).
+
+> **Tip:** ad-hoc signing (`CODESIGN_IDENTITY=-`) makes macOS re-prompt for Accessibility/Input-Monitoring permission on *every* rebuild. Sign with a stable identity to keep the grant across rebuilds:
+> ```bash
+> make ARCH="$(uname -m)" CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+> ```
 
 ## License
 
