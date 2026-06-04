@@ -92,6 +92,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
     private let _recording = OSAllocatedUnfairLock(initialState: false)
     @Published var audioLevel: Float = 0.0
     private let liveLevelNormalizerLock = OSAllocatedUnfairLock(initialState: LiveAudioLevelNormalizer())
+    // Smoothed envelope for the waveform (quick attack, gentle release) so the
+    // bars rise/fall smoothly instead of spiking frame to frame.
+    private var waveLevelSmoothed: Float = 0
 
     var onRecordingReady: (() -> Void)?
     var onRecordingFailure: ((Error) -> Void)?
@@ -740,12 +743,21 @@ final class AudioRecorder: NSObject, ObservableObject, AVCaptureAudioDataOutputS
         ) else { return 0 }
 
         let rms = rmsLevel(for: inputBuffer)
-        let normalizedDisplayLevel = liveLevelNormalizerLock.withLock {
-            $0.normalizedLevel(forRMS: rms)
-        }
+
+        // Overlay waveform level: a FIXED dB threshold off the RAW level, so the
+        // bars stay flat whenever you're not speaking. FreeFlow's adaptive AGC
+        // (LiveAudioLevelNormalizer) amplifies ambient up to "always visible", so
+        // in a loud room — e.g. an airport — it never rests and can't drive a
+        // "flat unless speaking" meter. Measured: silence ≈ −60 dB, speech ≈ −50…−34 dB.
+        let db = 20 * log10f(max(rms, 1e-7))
+        let target = min(max((db + 54) / 22, 0), 1)
+        // Quick attack, gentle release → smooth envelope, no spikes.
+        let alpha: Float = target > waveLevelSmoothed ? 0.45 : 0.12
+        waveLevelSmoothed += (target - waveLevelSmoothed) * alpha
+        let waveLevel = waveLevelSmoothed
 
         DispatchQueue.main.async {
-            self.audioLevel = normalizedDisplayLevel
+            self.audioLevel = waveLevel
         }
         return rms
     }

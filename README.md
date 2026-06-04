@@ -15,6 +15,19 @@
 
 ---
 
+> ### 🍴 This is a fork
+> This is a **fork of [zachlatta/freeflow](https://github.com/zachlatta/freeflow)** — all
+> credit for FreeFlow goes to the original authors. This fork adds:
+> - **Fully local / hybrid speech-to-text** so you don't need a paid API — local
+>   `whisper.cpp` (Metal) for transcription + a small router that uses Groq's free
+>   `gpt-oss-20b` when online and falls back to a local Ollama model when offline.
+>   See **[`local-setup/`](local-setup/)**.
+> - **Whisper VAD** so it stops hallucinating "Thank you" on silence.
+> - **Overlay tweaks:** a bottom-of-screen recording pill, a center-out reactive
+>   waveform that's flat when silent, fade in/out, and no processing spinner.
+>
+> Upstream: https://github.com/zachlatta/freeflow
+
 <p align="center">
   <img src="Resources/demo.gif" alt="FreeFlow demo" width="600">
 </p>
