@@ -44,7 +44,7 @@ private func makeOverlayPanel(width: CGFloat, height: CGFloat) -> NSPanel {
     )
     panel.backgroundColor = .clear
     panel.isOpaque = false
-    panel.hasShadow = true
+    panel.hasShadow = false
     panel.level = .screenSaver
     panel.ignoresMouseEvents = true
     panel.collectionBehavior = [.canJoinAllSpaces]
@@ -57,12 +57,47 @@ private func makeNotchContent<V: View>(
     width: CGFloat,
     height: CGFloat,
     cornerRadius: CGFloat,
+    glass: Bool = false,
     rootView: V
 ) -> NSView {
-    let shaped = rootView
-        .frame(width: width, height: height)
-        .background(Color.black)
-        .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: cornerRadius, bottomTrailingRadius: cornerRadius))
+    // Bottom floating pill → light Liquid Glass (NSGlassEffectView), used directly
+    // as the panel's contentView with the waveform as its content. (Regular variant,
+    // no tint, adapts to light/dark.)
+    if glass {
+        let host = NSHostingView(rootView: AnyView(rootView.frame(width: width, height: height)))
+        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        host.autoresizingMask = [.width, .height]
+
+        if #available(macOS 26.0, *) {
+            let g = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+            g.cornerRadius = height / 2
+            g.contentView = host
+            g.autoresizingMask = [.width, .height]
+            return g
+        }
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        container.autoresizingMask = [.width, .height]
+        let vev = NSVisualEffectView(frame: container.bounds)
+        vev.material = .hudWindow
+        vev.blendingMode = .behindWindow
+        vev.state = .active
+        vev.wantsLayer = true
+        vev.layer?.cornerRadius = height / 2
+        vev.layer?.masksToBounds = true
+        vev.autoresizingMask = [.width, .height]
+        container.addSubview(vev)
+        host.frame = container.bounds
+        container.addSubview(host)
+        return container
+    }
+
+    let base = rootView.frame(width: width, height: height)
+    let shaped = AnyView(
+        base
+            .background(Color.black)
+            .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: cornerRadius, bottomTrailingRadius: cornerRadius))
+    )
 
     let hosting = NSHostingView(rootView: shaped)
     hosting.frame = NSRect(x: 0, y: 0, width: width, height: height)
@@ -122,6 +157,16 @@ final class RecordingOverlayManager {
         guard let screen = targetScreen else { return 0 }
         return screen.frame.maxY - screen.visibleFrame.maxY
     }
+
+    /// When `overlay_position` is "bottom", the pill anchors near the bottom of
+    /// the screen (Wispr Flow style) and slides up, instead of dropping from the
+    /// menu bar. Any other value (or unset) keeps the default top placement.
+    private var overlayAtBottom: Bool {
+        UserDefaults.standard.string(forKey: "overlay_position") == "bottom"
+    }
+
+    /// Gap between the pill and the bottom edge / Dock when bottom-anchored.
+    static let bottomMargin: CGFloat = 28
 
     private var overlayAcceptsMouseEvents: Bool {
         (overlayState.phase == .recording && overlayState.recordingTriggerMode == .toggle)
@@ -244,7 +289,13 @@ final class RecordingOverlayManager {
 
         if let panel = overlayWindow {
             panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
-            panel.contentView = makeOverlayContent(frame: frame)
+            // For the bottom glass pill, DON'T rebuild the content on phase
+            // changes — the SwiftUI view observes shared state and updates itself.
+            // Rebuilding made the NSGlassEffectView re-sample and flash light/dark.
+            // (The notch/winged layout still rebuilds: its content type changes.)
+            if !overlayAtBottom {
+                panel.contentView = makeOverlayContent(frame: frame)
+            }
             resize(panel: panel, to: frame, animated: animatedResize)
             panel.alphaValue = 1
             panel.orderFrontRegardless()
@@ -252,21 +303,22 @@ final class RecordingOverlayManager {
         }
 
         let panel = makeOverlayPanel(width: frame.width, height: frame.height)
+        // No window shadow: on a white backdrop it draws a crisp dark line right
+        // at the capsule rim (the "black border"). Liquid Glass provides its own
+        // elevation, so the window must not add one.
         panel.hasShadow = false
         panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
         panel.contentView = makeOverlayContent(frame: frame)
 
-        guard let screen = targetScreen else { return }
-
-        let hiddenFrame = NSRect(x: frame.origin.x, y: screen.frame.maxY, width: frame.width, height: frame.height)
-        panel.setFrame(hiddenFrame, display: true)
-        panel.alphaValue = 1
+        // Quick fade-in at the final position (no slide).
+        panel.setFrame(frame, display: true)
+        panel.alphaValue = 0
         panel.orderFrontRegardless()
 
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.56, 0.64, 1.0)
-            panel.animator().setFrame(frame, display: true)
+            context.duration = 0.12
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
         }
 
         overlayWindow = panel
@@ -311,6 +363,7 @@ final class RecordingOverlayManager {
             width: frame.width,
             height: frame.height,
             cornerRadius: screenHasNotch ? 18 : 12,
+            glass: overlayAtBottom,
             rootView: AnyView(
                 RecordingOverlayView(
                     state: overlayState,
@@ -321,7 +374,7 @@ final class RecordingOverlayManager {
                         self?.onUpdateOverlayPressed?()
                     }
                 )
-                .padding(.top, screenHasNotch ? notchOverlap : 0)
+                .padding(.top, (!overlayAtBottom && screenHasNotch) ? notchOverlap : 0)
             )
         )
     }
@@ -378,6 +431,13 @@ final class RecordingOverlayManager {
         }
 
         let width = overlayWidth
+        if overlayAtBottom {
+            // Bottom-anchored pill, centered just above the Dock.
+            let height: CGFloat = 38
+            let x = screen.frame.midX - width / 2
+            let y = screen.visibleFrame.minY + Self.bottomMargin
+            return NSRect(x: x, y: y, width: width, height: height)
+        }
         let useCompact = (UserDefaults.standard.object(forKey: "use_compact_overlay") as? Bool) ?? true
         // Compact mode: overlay sits flush with the menu bar on every display.
         // notchOverlap equals the menu-bar height on non-notched screens too,
@@ -391,6 +451,16 @@ final class RecordingOverlayManager {
     }
 
     private var overlayWidth: CGFloat {
+        if overlayAtBottom {
+            // Bottom pill: one consistent width on every display — never the
+            // notch-derived width (there is no notch down here).
+            if overlayState.phase == .feedback {
+                guard let msg = overlayState.errorMessage, !msg.isEmpty else { return 130 }
+                return min(360, max(160, CGFloat(msg.count) * 6.8 + 56))
+            }
+            return overlayState.isCommandMode ? 168 : 138
+        }
+
         if let lockedOverlayWidth, overlayState.phase == .transcribing {
             return lockedOverlayWidth
         }
@@ -447,8 +517,14 @@ final class RecordingOverlayManager {
         overlayState.isCommandMode = false
         overlayState.updateVersion = ""
         if let panel = overlayWindow {
-            panel.orderOut(nil)
             overlayWindow = nil
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().alphaValue = 0
+            }, completionHandler: {
+                panel.orderOut(nil)
+            })
         }
     }
 }
@@ -565,72 +641,65 @@ struct WaveformBar: View {
 
     var body: some View {
         Capsule()
-            .fill(.white)
+            .fill(
+                LinearGradient(
+                    colors: [Color(red: 0.34, green: 0.82, blue: 1.0), Color(red: 0.22, green: 0.55, blue: 1.0)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
             .frame(width: 3, height: minHeight + (maxHeight - minHeight) * amplitude)
+            .shadow(color: .black.opacity(0.3), radius: 1, y: 0.5)
     }
 }
 
 struct WaveformView: View {
     let audioLevel: Float
-    var showsActivityPulse = false
+    /// Transcribing/initializing → show a lively traveling wave as a "working"
+    /// indicator (no spinner). Recording → drive bars off the live mic level.
+    var isLoading: Bool = false
 
-    private static let barCount = 9
-    private static let multipliers: [CGFloat] = [0.35, 0.55, 0.75, 0.9, 1.0, 0.9, 0.75, 0.55, 0.35]
-    private static let centerIndex = CGFloat((barCount - 1) / 2)
+    private static let barCount = 13
+    // Per-bar seeds give each bar its own pseudo-random phase so speaking looks
+    // like a real, non-uniform waveform rather than a smooth symmetric bump.
+    // The audio level is already dB-gated at the source (flat = 0 when silent),
+    // so this is just a tiny floor to avoid sub-pixel flicker.
+    private static let silenceGate: CGFloat = 0.05
 
     var body: some View {
-        Group {
-            if showsActivityPulse {
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
-                    waveformBars(pulseTime: context.date.timeIntervalSinceReferenceDate)
+        TimelineView(.animation) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 2.5) {
+                ForEach(0..<Self.barCount, id: \.self) { index in
+                    WaveformBar(amplitude: amplitude(for: index, at: t))
                 }
-            } else {
-                waveformBars(pulseTime: nil)
             }
         }
         .frame(height: 24)
     }
 
-    private func waveformBars(pulseTime: TimeInterval?) -> some View {
-        HStack(spacing: 2.5) {
-            ForEach(0..<Self.barCount, id: \.self) { index in
-                WaveformBar(amplitude: barAmplitude(for: index, pulseTime: pulseTime))
-                    .animation(
-                        .spring(
-                            response: barResponse(for: index),
-                            dampingFraction: 0.88
-                        )
-                        .delay(barDelay(for: index)),
-                        value: audioLevel
-                    )
-            }
+    private func amplitude(for index: Int, at t: TimeInterval) -> CGFloat {
+        let center = CGFloat(Self.barCount - 1) / 2
+        let d = abs(CGFloat(index) - center) / center          // 0 center … 1 edge
+
+        if isLoading {
+            // Loading: a pulse that emanates from the center outward.
+            let wave = 0.5 + 0.5 * sin(t * 5.0 - Double(d) * 3.2)
+            return 0.16 + 0.55 * CGFloat(wave)
         }
-    }
 
-    private func barAmplitude(for index: Int, pulseTime: TimeInterval?) -> CGFloat {
+        // Flat & still until you actually speak.
         let level = CGFloat(max(audioLevel, 0))
-        let baseAmplitude = min(level * Self.multipliers[index], 1.0)
+        let speaking = max(level - Self.silenceGate, 0) / (1 - Self.silenceGate)
+        guard speaking > 0 else { return 0 }
 
-        guard let pulseTime else { return baseAmplitude }
-
-        let travelingWave = CGFloat(0.5 + 0.5 * sin((pulseTime * 6.2) - Double(index) * 0.78))
-        let shimmer = CGFloat(0.5 + 0.5 * sin((pulseTime * 3.1) + Double(index) * 0.5))
-        let pulse = travelingWave * 0.22 + shimmer * 0.06
-
-        let saturationRelief = baseAmplitude * (0.74 + pulse)
-        let quietPulse = (1.0 - baseAmplitude) * (0.04 + pulse * 0.28)
-        return min(saturationRelief + quietPulse, 1.0)
-    }
-
-    private func barResponse(for index: Int) -> Double {
-        let distance = abs(CGFloat(index) - Self.centerIndex)
-        let normalizedDistance = distance / Self.centerIndex
-        return 0.18 + Double(normalizedDistance) * 0.06
-    }
-
-    private func barDelay(for index: Int) -> Double {
-        let distance = abs(CGFloat(index) - Self.centerIndex)
-        return Double(distance) * 0.01
+        // Motion starts in the MIDDLE and RIPPLES OUTWARD: bars are weighted
+        // tallest at the center, and each bar's wave phase is delayed by its
+        // distance from center — so a pulse radiates out to the edges instead of
+        // the whole row rising and falling together.
+        let ripple = 0.5 + 0.5 * sin(t * 5.5 - Double(d) * 3.4)
+        let weight = 1.0 - d * 0.55                            // center-weighted
+        return min(speaking * weight * (0.45 + 0.55 * CGFloat(ripple)), 1.0)
     }
 }
 
@@ -946,21 +1015,14 @@ struct RecordingOverlayView: View {
                 UpdateAvailableOverlayView(onPress: onUpdateOverlayPressed)
             } else {
                 ZStack {
-                    Group {
-                        if state.phase == .initializing {
-                            InitializingDotsView()
-                                .transition(.opacity)
-                        } else if showsLiveRecordingContent {
-                            WaveformView(
-                                audioLevel: state.audioLevel,
-                                showsActivityPulse: state.phase == .recording
-                            )
-                                .transition(.opacity)
-                        } else {
-                            ProcessingIndicatorView()
-                                .transition(.opacity)
-                        }
-                    }
+                    // Always the waveform — never dots or a spinner. Flat when
+                    // silent, random/reactive while speaking, and a traveling
+                    // wave while transcribing (the "loading" indicator).
+                    WaveformView(
+                        audioLevel: state.audioLevel,
+                        isLoading: state.phase == .transcribing || state.phase == .initializing
+                    )
+                    .transition(.opacity)
 
                     HStack {
                         Group {
