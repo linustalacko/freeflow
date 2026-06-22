@@ -2412,6 +2412,8 @@ struct RunLogEntryView: View {
                                         }
                                     }
 
+                                    PipelineCorrectionEditor(item: item)
+
                                     if !item.postProcessedTranscript.isEmpty {
                                         Text(item.postProcessedTranscript)
                                             .font(.system(.caption, design: .monospaced))

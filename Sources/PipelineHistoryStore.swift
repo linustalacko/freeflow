@@ -101,6 +101,7 @@ final class PipelineHistoryStore {
                 entity.contextAppName = item.contextAppName
                 entity.contextBundleIdentifier = item.contextBundleIdentifier
                 entity.contextWindowTitle = item.contextWindowTitle
+                entity.correctedTranscript = item.correctedTranscript
                 try saveContext()
             } catch {
                 thrownError = error
@@ -210,6 +211,7 @@ final class PipelineHistoryStore {
                 entity.contextAppName = item.contextAppName
                 entity.contextBundleIdentifier = item.contextBundleIdentifier
                 entity.contextWindowTitle = item.contextWindowTitle
+                entity.correctedTranscript = item.correctedTranscript
                 try saveContext()
             } catch {
                 thrownError = error
@@ -287,7 +289,8 @@ final class PipelineHistoryStore {
             audioFileName: entity.audioFileName,
             contextAppName: entity.contextAppName,
             contextBundleIdentifier: entity.contextBundleIdentifier,
-            contextWindowTitle: entity.contextWindowTitle
+            contextWindowTitle: entity.contextWindowTitle,
+            correctedTranscript: entity.correctedTranscript
         )
     }
 
@@ -319,7 +322,8 @@ final class PipelineHistoryStore {
             makeAttribute(name: "audioFileName", type: .stringAttributeType, isOptional: true),
             makeAttribute(name: "contextAppName", type: .stringAttributeType, isOptional: true),
             makeAttribute(name: "contextBundleIdentifier", type: .stringAttributeType, isOptional: true),
-            makeAttribute(name: "contextWindowTitle", type: .stringAttributeType, isOptional: true)
+            makeAttribute(name: "contextWindowTitle", type: .stringAttributeType, isOptional: true),
+            makeAttribute(name: "correctedTranscript", type: .stringAttributeType, isOptional: true)
         ]
 
         model.entities = [entity]
@@ -364,4 +368,5 @@ final class PipelineHistoryEntry: NSManagedObject {
     @NSManaged var contextAppName: String?
     @NSManaged var contextBundleIdentifier: String?
     @NSManaged var contextWindowTitle: String?
+    @NSManaged var correctedTranscript: String?
 }
