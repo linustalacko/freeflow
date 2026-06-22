@@ -581,6 +581,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var audioDeviceObservers: [NSObjectProtocol] = []
     private var needsMicrophoneRefreshAfterRecording = false
     private let pipelineHistoryStore = PipelineHistoryStore()
+    /// Passively captures inline edits you make to dictated text (no manual
+    /// correcting in the Run Log).
+    private lazy var inlineEditCapture: InlineEditCaptureService = {
+        let service = InlineEditCaptureService()
+        service.onCorrection = { [weak self] itemID, corrected in
+            self?.captureInlineCorrection(itemID: itemID, corrected: corrected)
+        }
+        return service
+    }()
     private let shortcutSessionController = DictationShortcutSessionController()
     private var activeRecordingTriggerMode: RecordingTriggerMode?
     private var currentSessionIntent: SessionIntent = .dictation
@@ -767,6 +776,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 self?.handleOverlayStopButtonPressed()
             }
         }
+        installCommandTickMonitors()
         overlayManager.onUpdateOverlayPressed = { [weak self] in
             DispatchQueue.main.async {
                 self?.handleUpdateOverlayPressed()
@@ -966,11 +976,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     func makeTranscriptionService() throws -> TranscriptionService {
-        try TranscriptionService(
+        let vocabulary = customVocabulary.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try TranscriptionService(
             apiKey: resolvedTranscriptionAPIKey,
             baseURL: resolvedTranscriptionBaseURL,
             transcriptionModel: transcriptionModel,
-            language: resolvedTranscriptionLanguage
+            language: resolvedTranscriptionLanguage,
+            vocabularyPrompt: vocabulary.isEmpty ? nil : "Glossary: \(vocabulary)"
         )
     }
 
@@ -1096,6 +1108,54 @@ final class AppState: ObservableObject, @unchecked Sendable {
         } catch {
             errorMessage = "Unable to delete run history entry: \(error.localizedDescription)"
         }
+    }
+
+    /// Saves a human correction for a dictation as the gold training label.
+    /// Passing empty text clears the correction.
+    func saveCorrection(_ corrected: String, for item: PipelineHistoryItem) {
+        let trimmed = corrected.trimmingCharacters(in: .whitespacesAndNewlines)
+        let updated = PipelineHistoryItem(
+            intent: item.intent,
+            selectedText: item.selectedText,
+            capturedSelection: item.capturedSelection,
+            id: item.id,
+            timestamp: item.timestamp,
+            rawTranscript: item.rawTranscript,
+            postProcessedTranscript: item.postProcessedTranscript,
+            postProcessingPrompt: item.postProcessingPrompt,
+            systemPrompt: item.systemPrompt,
+            contextSummary: item.contextSummary,
+            contextSystemPrompt: item.contextSystemPrompt,
+            contextPrompt: item.contextPrompt,
+            contextScreenshotDataURL: item.contextScreenshotDataURL,
+            contextScreenshotStatus: item.contextScreenshotStatus,
+            postProcessingStatus: item.postProcessingStatus,
+            debugStatus: item.debugStatus,
+            customVocabulary: item.customVocabulary,
+            audioFileName: item.audioFileName,
+            contextAppName: item.contextAppName,
+            contextBundleIdentifier: item.contextBundleIdentifier,
+            contextWindowTitle: item.contextWindowTitle,
+            correctedTranscript: trimmed.isEmpty ? nil : trimmed
+        )
+        do {
+            try pipelineHistoryStore.update(updated)
+            pipelineHistory = pipelineHistoryStore.loadAllHistory()
+        } catch {
+            errorMessage = "Unable to save correction: \(error.localizedDescription)"
+        }
+    }
+
+    /// Invoked by the passive inline-edit watcher when it detects you edited a
+    /// dictation in place. Saves it as a gold label — unless you already
+    /// corrected it manually or it matches the original output.
+    private func captureInlineCorrection(itemID: UUID, corrected: String) {
+        guard let item = pipelineHistory.first(where: { $0.id == itemID }) else { return }
+        if let existing = item.correctedTranscript, !existing.isEmpty { return }
+        let a = corrected.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = item.postProcessedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard a != b else { return }
+        saveCorrection(corrected, for: item)
     }
 
     func retryTranscription(item: PipelineHistoryItem) {
@@ -1245,8 +1305,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
         hasScreenRecordingPermission = hasScreenCapturePermission()
         accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             DispatchQueue.main.async {
-                self?.hasAccessibility = AXIsProcessTrusted()
-                self?.hasScreenRecordingPermission = self?.hasScreenCapturePermission() ?? false
+                guard let self else { return }
+                let nowTrusted = AXIsProcessTrusted()
+                let wasTrusted = self.hasAccessibility
+                self.hasAccessibility = nowTrusted
+                self.hasScreenRecordingPermission = self.hasScreenCapturePermission()
+                // Self-heal: the global-hotkey event tap can't be installed without
+                // Accessibility, so if the tap failed at launch and the user grants
+                // Accessibility *while the app is running*, re-arm it immediately
+                // instead of requiring a relaunch.
+                if nowTrusted && !wasTrusted {
+                    self.restartHotkeyMonitoring()
+                }
             }
         }
     }
@@ -1713,6 +1783,49 @@ final class AppState: ObservableObject, @unchecked Sendable {
         stopAndTranscribe()
     }
 
+    // MARK: - ⌘-tap finishes a locked (toggle) dictation
+
+    private var commandTapArmed = false
+    private var previousModifierFlags: NSEvent.ModifierFlags = []
+
+    /// While a toggle ("locked") dictation is running, a bare press-and-release
+    /// of ⌘ — with no other keys or modifiers in between — acts exactly like
+    /// clicking the tick. Arming requires the press to start from a clean
+    /// (no-modifier) state so the Cmd+Ctrl shortcut tap itself never triggers it.
+    private func installCommandTickMonitors() {
+        let relevant: NSEvent.ModifierFlags = [.command, .control, .option, .shift, .function]
+        let flagsHandler: (NSEvent) -> Void = { [weak self] event in
+            guard let self else { return }
+            let mods = event.modifierFlags.intersection(relevant)
+            defer { self.previousModifierFlags = mods }
+            guard self.isRecording, self.activeRecordingTriggerMode == .toggle else {
+                self.commandTapArmed = false
+                return
+            }
+            if mods == [.command], self.previousModifierFlags.isEmpty {
+                self.commandTapArmed = true
+            } else if mods.isEmpty {
+                if self.commandTapArmed {
+                    self.commandTapArmed = false
+                    DispatchQueue.main.async { self.handleOverlayStopButtonPressed() }
+                }
+            } else {
+                self.commandTapArmed = false
+            }
+        }
+        let keyHandler: (NSEvent) -> Void = { [weak self] _ in self?.commandTapArmed = false }
+        _ = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged, handler: flagsHandler)
+        _ = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
+            flagsHandler(event)
+            return event
+        }
+        _ = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: keyHandler)
+        _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            keyHandler(event)
+            return event
+        }
+    }
+
     private func cancelToggleShortcutSession() {
         guard pendingShortcutStartMode == .toggle || activeRecordingTriggerMode == .toggle else { return }
 
@@ -1891,6 +2004,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let t0 = CFAbsoluteTimeGetCurrent()
         os_log(.info, log: recordingLog, "startRecording() entered")
         guard !isRecording && !isTranscribing else { return }
+        // Capture any inline edit from the previous dictation BEFORE this one
+        // changes the field.
+        DispatchQueue.main.async { [weak self] in self?.inlineEditCapture.flush() }
         let scheduledSelectionSnapshot = pendingSelectionSnapshot
         let scheduledManualCommandInvocation = pendingManualCommandInvocation
         cancelPendingShortcutStart()
@@ -2103,6 +2219,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         isRecording = true
         statusText = "Starting..."
         hasShownScreenshotPermissionAlert = false
+
+        // Pre-warm the cleanup LLM while the user is still speaking, so an
+        // offline/local model is already loaded by the time transcription
+        // finishes. Fire-and-forget; providers without /warm just 404.
+        if let warmURL = URL(string: "\(apiBaseURL)/warm") {
+            var warmRequest = URLRequest(url: warmURL)
+            warmRequest.httpMethod = "POST"
+            warmRequest.timeoutInterval = 3
+            URLSession.shared.dataTask(with: warmRequest).resume()
+        }
 
         // Show initializing dots only if engine takes longer than 0.2s to start
         var overlayShown = false
@@ -2336,6 +2462,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private enum TranscriptProcessingOutcome {
         case skippedEmptyRawTranscript
         case voiceMacro(command: String)
+        case shortUtterancePastedRaw
         case postProcessingSucceeded
         case postProcessingFailedFallback
         case commandModeSucceeded(invocation: CommandInvocation)
@@ -2347,6 +2474,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return "Skipped macros and post-processing for empty raw transcript"
             case .voiceMacro(let command):
                 return "Voice macro used: \(command)"
+            case .shortUtterancePastedRaw:
+                return "Short utterance, pasted instantly without post-processing"
             case .postProcessingSucceeded:
                 return isRetry ? "Post-processing succeeded (retried)" : "Post-processing succeeded"
             case .postProcessingFailedFallback:
@@ -2396,7 +2525,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
             os_log(.info, log: recordingLog, "Voice macro triggered: %{public}@", macro.command)
             return (macro.payload, .voiceMacro(command: macro.command), "")
         }
-        
+
+        // Fast path: very short utterances ("yes", "sounds good", "thanks") gain
+        // nothing from LLM cleanup — skip it and paste instantly instead of
+        // paying a 0.5–3s round trip. Whisper already punctuates/capitalizes.
+        let words = trimmedRawTranscript.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+        if words.count <= 3 {
+            let flattened = words.joined(separator: " ")
+            os_log(.info, log: recordingLog, "Short utterance fast path (%d words), skipping post-processing", words.count)
+            return (flattened, .shortUtterancePastedRaw, "")
+        }
+
         do {
             let result = try await postProcessingService.postProcess(
                 transcript: trimmedRawTranscript,
@@ -2588,7 +2727,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.lastRawTranscript = trimmedRawTranscript
                         self.lastPostProcessedTranscript = trimmedFinalTranscript
                         self.lastPostProcessingStatus = processingStatus
-                        self.recordPipelineHistoryEntry(
+                        let recordedItemID = self.recordPipelineHistoryEntry(
                             rawTranscript: trimmedRawTranscript,
                             postProcessedTranscript: trimmedFinalTranscript,
                             postProcessingPrompt: result.prompt,
@@ -2644,6 +2783,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                     }
                                 } else {
                                     self.restoreClipboardIfNeeded(pendingClipboardRestore)
+                                }
+                                // After our text lands, snapshot the field so we can
+                                // passively capture any inline edits you make to it.
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                    self.inlineEditCapture.noteInsertion(
+                                        itemID: recordedItemID,
+                                        inserted: trimmedFinalTranscript
+                                    )
                                 }
                             }
                         }
@@ -2708,6 +2855,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             : customSystemPrompt
     }
 
+    @discardableResult
     private func recordPipelineHistoryEntry(
         rawTranscript: String,
         postProcessedTranscript: String,
@@ -2717,7 +2865,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         processingStatus: String,
         intent: SessionIntent,
         audioFileName: String? = nil
-    ) {
+    ) -> UUID {
         let newEntry = PipelineHistoryItem(
             intent: intent.persistedIntent,
             selectedText: intent.persistedSelectedText,
@@ -2750,6 +2898,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         } catch {
             errorMessage = "Unable to save run history entry: \(error.localizedDescription)"
         }
+        return newEntry.id
     }
 
     private func startRealtimeStreamingIfEnabled() {

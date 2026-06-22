@@ -60,25 +60,22 @@ private func makeNotchContent<V: View>(
     glass: Bool = false,
     rootView: V
 ) -> NSView {
-    // Bottom floating pill → light Liquid Glass (NSGlassEffectView), used directly
-    // as the panel's contentView with the waveform as its content. (Regular variant,
-    // no tint, adapts to light/dark.)
+    // Bottom floating pill → REAL liquid-glass refraction via the custom lens
+    // (LiquidGlassBackdropView: ScreenCaptureKit + CIGlassLozenge). Native
+    // NSGlassEffectView can't refract other apps' windows and renders as frost at
+    // pill sizes, so it serves only as the base/fallback when Screen Recording
+    // permission is missing; the lens layers above it, waveform on top.
     if glass {
-        let host = NSHostingView(rootView: AnyView(rootView.frame(width: width, height: height)))
-        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
-        host.autoresizingMask = [.width, .height]
-
-        if #available(macOS 26.0, *) {
-            let g = NSGlassEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-            g.cornerRadius = height / 2
-            g.contentView = host
-            g.autoresizingMask = [.width, .height]
-            return g
-        }
-
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        let bounds = NSRect(x: 0, y: 0, width: width, height: height)
+        let container = NSView(frame: bounds)
         container.autoresizingMask = [.width, .height]
-        let vev = NSVisualEffectView(frame: container.bounds)
+
+        // Frost base, ALWAYS present: it's what shows whenever the lens has no
+        // frame (permission missing, capture failing, or pre-first-frame). The
+        // pill must never render transparent. The lens layers over it once a
+        // frame lands; the fade-in already waits for that frame when the lens is
+        // available, so the frost doesn't cause a colour flash.
+        let vev = NSVisualEffectView(frame: bounds)
         vev.material = .hudWindow
         vev.blendingMode = .behindWindow
         vev.state = .active
@@ -87,7 +84,48 @@ private func makeNotchContent<V: View>(
         vev.layer?.masksToBounds = true
         vev.autoresizingMask = [.width, .height]
         container.addSubview(vev)
-        host.frame = container.bounds
+
+        // NO layer shadow here: the blur spills past the pill and gets clipped
+        // square at the window boundary, painting a grey rounded-rect "box"
+        // around the pill (took a long bisect to find). If the pill ever needs
+        // elevation, it must come from a shadow drawn INSIDE the bounds.
+        container.wantsLayer = true
+
+        let lens = LiquidGlassBackdropView(frame: bounds)
+        lens.autoresizingMask = [.width, .height]
+        container.addSubview(lens)
+
+        // Edge treatment, iOS-style: a faint dark outer hairline for definition
+        // over light content + the bright specular highlight on top of it.
+        //
+        // FILL, don't pin: the bottom pill's content view is built once and never
+        // rebuilt on phase changes (showOverlayPanel skips the rebuild for the
+        // glass pill), while the panel itself resizes when the pill widens
+        // (recording → transcribing, command mode, etc.). The frost base and lens
+        // autoresize with the window, so a fixed `.frame(width:height:)` here would
+        // leave the capsule outline pinned at its original width while the glass
+        // background grew past it — the "background wider than the pill" artifact.
+        // maxWidth/maxHeight infinity makes the host's SwiftUI track the resize
+        // in lockstep with the frost and lens.
+        let content = AnyView(
+            rootView
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(
+                    Capsule().strokeBorder(Color.black.opacity(0.10), lineWidth: 1)
+                )
+                .overlay(
+                    Capsule()
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [.white.opacity(0.75), .white.opacity(0.10), .white.opacity(0.35)],
+                                startPoint: .top, endPoint: .bottom),
+                            lineWidth: 1)
+                        .padding(1)
+                )
+        )
+        let host = NSHostingView(rootView: content)
+        host.frame = bounds
+        host.autoresizingMask = [.width, .height]
         container.addSubview(host)
         return container
     }
@@ -299,6 +337,7 @@ final class RecordingOverlayManager {
             resize(panel: panel, to: frame, animated: animatedResize)
             panel.alphaValue = 1
             panel.orderFrontRegardless()
+            startLiquidLensIfNeeded(panel: panel, frame: frame)
             return
         }
 
@@ -307,6 +346,12 @@ final class RecordingOverlayManager {
         // at the capsule rim (the "black border"). Liquid Glass provides its own
         // elevation, so the window must not add one.
         panel.hasShadow = false
+        // The glass renders best at the same window level as the verified test
+        // harness; .screenSaver sits above the WindowServer tier where the glass
+        // material samples reliably.
+        if overlayAtBottom {
+            panel.level = .popUpMenu
+        }
         panel.ignoresMouseEvents = !overlayAcceptsMouseEvents
         panel.contentView = makeOverlayContent(frame: frame)
 
@@ -314,14 +359,48 @@ final class RecordingOverlayManager {
         panel.setFrame(frame, display: true)
         panel.alphaValue = 0
         panel.orderFrontRegardless()
+        overlayWindow = panel
 
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.12
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 1
+        let fadeIn = {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().alphaValue = 1
+            }
         }
 
-        overlayWindow = panel
+        // With the lens active, wait for its first frame before fading in — the
+        // pill would otherwise appear as a white/transparent flash for the
+        // ~200ms before capture starts. 350ms safety fallback.
+        if overlayAtBottom, CGPreflightScreenCaptureAccess(),
+           let lens = panel.contentView?.subviews.compactMap({ $0 as? LiquidGlassBackdropView }).first {
+            lens.onFirstFrame = { [weak panel] in
+                guard let panel, panel.alphaValue == 0 else { return }
+                fadeIn()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak panel] in
+                guard let panel, panel.alphaValue == 0 else { return }
+                fadeIn()
+            }
+        } else {
+            fadeIn()
+        }
+
+        startLiquidLensIfNeeded(panel: panel, frame: frame)
+    }
+
+    /// Kick the live refraction lens for the bottom glass pill. The lens needs
+    /// the panel's on-screen frame and window number, so it can only start after
+    /// orderFront. No-ops for the top/notch overlay or when the frame is unchanged.
+    private func startLiquidLensIfNeeded(panel: NSPanel, frame: NSRect) {
+        lensDebug("startLiquidLensIfNeeded: atBottom=\(overlayAtBottom) screen=\(targetScreen != nil) subviews=\(panel.contentView?.subviews.map { String(describing: type(of: $0)) } ?? [])")
+        guard overlayAtBottom, let screen = targetScreen else { return }
+        guard let lens = panel.contentView?.subviews.compactMap({ $0 as? LiquidGlassBackdropView }).first else { return }
+        lens.start(
+            pillFrameOnScreen: frame,
+            screen: screen,
+            excludingWindowNumber: panel.windowNumber
+        )
     }
 
     private func updateOverlayLayout(animated: Bool) {
@@ -433,7 +512,7 @@ final class RecordingOverlayManager {
         let width = overlayWidth
         if overlayAtBottom {
             // Bottom-anchored pill, centered just above the Dock.
-            let height: CGFloat = 38
+            let height: CGFloat = 27
             let x = screen.frame.midX - width / 2
             let y = screen.visibleFrame.minY + Self.bottomMargin
             return NSRect(x: x, y: y, width: width, height: height)
@@ -458,7 +537,18 @@ final class RecordingOverlayManager {
                 guard let msg = overlayState.errorMessage, !msg.isEmpty else { return 130 }
                 return min(360, max(160, CGFloat(msg.count) * 6.8 + 56))
             }
-            return overlayState.isCommandMode ? 168 : 138
+            if overlayState.isCommandMode { return 134 }
+            // Toggle ("locked") mode shows the tick on the left — widen so it
+            // doesn't overlap the waveform. Initializing shares the recording
+            // width so the warmup → recording handoff doesn't jump.
+            if overlayState.recordingTriggerMode == .toggle,
+               overlayState.phase == .recording || overlayState.phase == .initializing { return 144 }
+            // Transcribing shows the spinner to the right of the dots — needs
+            // room so the spinner doesn't crowd the rim. Initializing is NOT
+            // included: it now matches the resting recording pill (110), so
+            // there's no width pop when the first audio arrives.
+            if overlayState.phase == .transcribing { return 130 }
+            return 110
         }
 
         if let lockedOverlayWidth, overlayState.phase == .transcribing {
@@ -518,11 +608,18 @@ final class RecordingOverlayManager {
         overlayState.updateVersion = ""
         if let panel = overlayWindow {
             overlayWindow = nil
+            let lens = panel.contentView?.subviews
+                .compactMap { $0 as? LiquidGlassBackdropView }
+                .first
+            // Freeze the last lens frame through the fade-out — clearing it
+            // first made the pill flash white while fading.
+            lens?.freeze()
             NSAnimationContext.runAnimationGroup({ context in
                 context.duration = 0.16
                 context.timingFunction = CAMediaTimingFunction(name: .easeIn)
                 panel.animator().alphaValue = 0
             }, completionHandler: {
+                lens?.stop()
                 panel.orderOut(nil)
             })
         }
@@ -637,31 +734,27 @@ struct WaveformBar: View {
     let amplitude: CGFloat
 
     private let minHeight: CGFloat = 2
-    private let maxHeight: CGFloat = 22
+    private let maxHeight: CGFloat = 15
 
     var body: some View {
         Capsule()
             .fill(
                 LinearGradient(
-                    colors: [Color(red: 0.34, green: 0.82, blue: 1.0), Color(red: 0.22, green: 0.55, blue: 1.0)],
+                    // Adapts to appearance: near-black on the light-refracting
+                    // glass, white in dark mode where black would vanish.
+                    colors: [Color.primary, Color.primary.opacity(0.78)],
                     startPoint: .top,
                     endPoint: .bottom
                 )
             )
             .frame(width: 3, height: minHeight + (maxHeight - minHeight) * amplitude)
-            .shadow(color: .black.opacity(0.3), radius: 1, y: 0.5)
     }
 }
 
 struct WaveformView: View {
     let audioLevel: Float
-    /// Transcribing/initializing → show a lively traveling wave as a "working"
-    /// indicator (no spinner). Recording → drive bars off the live mic level.
-    var isLoading: Bool = false
 
     private static let barCount = 13
-    // Per-bar seeds give each bar its own pseudo-random phase so speaking looks
-    // like a real, non-uniform waveform rather than a smooth symmetric bump.
     // The audio level is already dB-gated at the source (flat = 0 when silent),
     // so this is just a tiny floor to avoid sub-pixel flicker.
     private static let silenceGate: CGFloat = 0.05
@@ -675,18 +768,12 @@ struct WaveformView: View {
                 }
             }
         }
-        .frame(height: 24)
+        .frame(height: 16)
     }
 
     private func amplitude(for index: Int, at t: TimeInterval) -> CGFloat {
         let center = CGFloat(Self.barCount - 1) / 2
         let d = abs(CGFloat(index) - center) / center          // 0 center … 1 edge
-
-        if isLoading {
-            // Loading: a pulse that emanates from the center outward.
-            let wave = 0.5 + 0.5 * sin(t * 5.0 - Double(d) * 3.2)
-            return 0.16 + 0.55 * CGFloat(wave)
-        }
 
         // Flat & still until you actually speak.
         let level = CGFloat(max(audioLevel, 0))
@@ -700,6 +787,18 @@ struct WaveformView: View {
         let ripple = 0.5 + 0.5 * sin(t * 5.5 - Double(d) * 3.4)
         let weight = 1.0 - d * 0.55                            // center-weighted
         return min(speaking * weight * (0.45 + 0.55 * CGFloat(ripple)), 1.0)
+    }
+}
+
+/// Small activity spinner: the native macOS circular indicator (the custom
+/// spoke version rendered its side spokes as stray horizontal dashes at this
+/// tiny size).
+struct IOSSpinner: View {
+    var body: some View {
+        ProgressView()
+            .progressViewStyle(.circular)
+            .controlSize(.small)
+            .tint(.primary)
     }
 }
 
@@ -1015,41 +1114,46 @@ struct RecordingOverlayView: View {
                 UpdateAvailableOverlayView(onPress: onUpdateOverlayPressed)
             } else {
                 ZStack {
-                    // Always the waveform — never dots or a spinner. Flat when
-                    // silent, random/reactive while speaking, and a traveling
-                    // wave while transcribing (the "loading" indicator).
-                    WaveformView(
-                        audioLevel: state.audioLevel,
-                        isLoading: state.phase == .transcribing || state.phase == .initializing
-                    )
+                    // Waveform stays put in every phase (flat when silent,
+                    // reactive while speaking). While transcribing/initializing
+                    // the bars are flat and an iOS-style spinner appears to the
+                    // right of them.
+                    // Spinner means "transcribing" (audio → text). The brief
+                    // .initializing warmup at start is NOT loading anything yet,
+                    // so it shows a flat resting waveform with no spinner.
+                    let loading = state.phase == .transcribing
+                    HStack(spacing: 7) {
+                        WaveformView(audioLevel: loading ? 0 : state.audioLevel)
+                        if loading {
+                            IOSSpinner()
+                                .transition(.opacity)
+                        }
+                    }
                     .transition(.opacity)
 
                     HStack {
                         Group {
-                            if state.isCommandMode {
+                            if showsStopButton {
+                                // Toggle ("locked") mode: black circle with a
+                                // white tick on the LEFT finishes the dictation.
+                                Button(action: onStopButtonPressed) {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 8, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .frame(width: 15, height: 15)
+                                        .background(Circle().fill(Color.black.opacity(0.85)))
+                                }
+                                .buttonStyle(.plain)
+                                .transition(.move(edge: .leading).combined(with: .opacity))
+                            } else if state.isCommandMode {
                                 CommandModeIndicator()
                                     .transition(.opacity)
                             }
                         }
-                        .frame(width: leadingAccessoryWidth, alignment: .center)
+                        .frame(width: leadingAccessoryWidth, alignment: .leading)
                         .frame(maxHeight: .infinity, alignment: .center)
 
                         Spacer(minLength: 0)
-
-                        Group {
-                            if showsStopButton {
-                                Button(action: onStopButtonPressed) {
-                                    Image(systemName: "stop.fill")
-                                        .font(.system(size: 7, weight: .bold))
-                                        .foregroundStyle(.white)
-                                        .frame(width: 14, height: 14)
-                                        .background(Circle().fill(Color.red.opacity(0.92)))
-                                }
-                                .buttonStyle(.plain)
-                                .transition(.move(edge: .trailing).combined(with: .opacity))
-                            }
-                        }
-                        .frame(width: trailingAccessoryWidth, alignment: .trailing)
                     }
                 }
             }

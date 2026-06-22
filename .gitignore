@@ -3,3 +3,7 @@ build/
 *.swp
 .env
 .build
+__pycache__/
+*.pyc
+*.key
+.openrouter_key

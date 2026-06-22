@@ -14,6 +14,8 @@ struct PipelineHistoryItem: Identifiable, Codable {
     let timestamp: Date
     let rawTranscript: String
     let postProcessedTranscript: String
+    /// Human correction of the post-processed output — the gold training label.
+    let correctedTranscript: String?
     let postProcessingPrompt: String?
     let systemPrompt: String?
     let contextSummary: String
@@ -50,7 +52,8 @@ struct PipelineHistoryItem: Identifiable, Codable {
         audioFileName: String? = nil,
         contextAppName: String? = nil,
         contextBundleIdentifier: String? = nil,
-        contextWindowTitle: String? = nil
+        contextWindowTitle: String? = nil,
+        correctedTranscript: String? = nil
     ) {
         self.intent = intent
         self.selectedText = selectedText
@@ -73,5 +76,6 @@ struct PipelineHistoryItem: Identifiable, Codable {
         self.contextAppName = contextAppName
         self.contextBundleIdentifier = contextBundleIdentifier
         self.contextWindowTitle = contextWindowTitle
+        self.correctedTranscript = correctedTranscript
     }
 }
