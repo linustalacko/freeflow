@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Replace YOUR_USERNAME and YOUR_GROQ_API_KEY (free at https://console.groq.com).
-     Leave the key blank to run FULLY LOCAL (always falls back to Ollama). -->
+     Leave the key blank to run FULLY LOCAL (always uses the local model).
+
+     Routing order (see router.py header for details):
+       Groq <model FreeFlow asked for> -> GROQ_FALLBACK_MODELS (each is a separate
+       per-minute token bucket on Groq's free tier) -> local model.
+     Set FORCE_LOCAL=1 to put the local model first (Groq becomes the safety net) —
+     e.g. once you've fine-tuned the on-device Qwen (see HOW_IT_WORKS.md) and point
+     LOCAL_URL/LOCAL_MODEL at the mlx_lm server. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -15,10 +22,26 @@
     <dict>
         <key>GROQ_API_KEY</key>
         <string>YOUR_GROQ_API_KEY</string>
+        <key>GROQ_FALLBACK_MODELS</key>
+        <string>openai/gpt-oss-120b,qwen/qwen3.6-27b</string>
         <key>ROUTER_PORT</key>
         <string>11435</string>
+        <!-- Local model: Ollama by default. For the fine-tuned MLX model use
+             LOCAL_URL=http://127.0.0.1:8081/v1/chat/completions and set
+             LOCAL_MODEL to whatever `mlx_lm server` was started with. -->
+        <key>LOCAL_URL</key>
+        <string>http://127.0.0.1:11434/v1/chat/completions</string>
         <key>LOCAL_MODEL</key>
         <string>llama3.1:8b</string>
+        <!-- For the mlx_lm fine-tune: MUST equal the server's --adapter-path, or the
+             base model is silently served (mlx_lm 0.31 quirk; see router.py). -->
+        <key>LOCAL_ADAPTER_PATH</key>
+        <string></string>
+        <!-- Should match OLLAMA_KEEP_ALIVE in com.freeflow.ollama.plist. -->
+        <key>LOCAL_KEEPALIVE_S</key>
+        <string>1800</string>
+        <key>FORCE_LOCAL</key>
+        <string>0</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
