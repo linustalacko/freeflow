@@ -7,6 +7,7 @@ import ApplicationServices
 import ScreenCaptureKit
 import Carbon
 import os.log
+import os
 private let recordingLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "Recording")
 
 struct VoiceMacro: Codable, Identifiable, Equatable {
@@ -2592,6 +2593,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case skippedEmptyRawTranscript
         case voiceMacro(command: String)
         case shortUtterancePastedRaw
+        case alreadyCleanPastedRaw
         case postProcessingSucceeded
         case postProcessingFailedFallback
         case preservedExactWording
@@ -2608,6 +2610,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return "Voice macro used: \(command)"
             case .shortUtterancePastedRaw:
                 return "Short utterance, pasted instantly without post-processing"
+            case .alreadyCleanPastedRaw:
+                return "Transcript already clean, pasted instantly without post-processing"
             case .postProcessingSucceeded:
                 return isRetry ? "Post-processing succeeded (retried)" : "Post-processing succeeded"
             case .postProcessingFailedFallback:
@@ -2703,6 +2707,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
             let flattened = words.joined(separator: " ")
             os_log(.info, log: recordingLog, "Short utterance fast path (%d words), skipping post-processing", words.count)
             return (flattened, .shortUtterancePastedRaw, "")
+        }
+
+        // Fast path 2: the STT output is already a clean short sentence (no
+        // fillers, self-corrections, spoken punctuation, mis-cased vocabulary)
+        // — the model would hand it back unchanged, so don't pay the round trip.
+        // Tune/disable with `defaults write … clean_transcript_fast_path_max_words N`.
+        let fastPathOverride = UserDefaults.standard.object(forKey: TranscriptFastPath.maxWordsDefaultsKey) as? Int
+        let fastPathMaxWords = fastPathOverride ?? TranscriptFastPath.defaultMaxWords
+        if customSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let alreadyClean = TranscriptFastPath.cleanedIfAlreadyClean(
+               trimmedRawTranscript, maxWords: fastPathMaxWords, vocabulary: customVocabulary,
+               emailTarget: TranscriptFastPath.looksLikeEmailTarget(
+                   bundleIdentifier: context.bundleIdentifier, appName: context.appName)
+           ) {
+            os_log(.info, log: recordingLog, "Already-clean fast path (%d words), skipping post-processing", words.count)
+            return (alreadyClean, .alreadyCleanPastedRaw, "")
         }
 
         do {
@@ -2856,7 +2877,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     let appContext: AppContext
                     if let sessionContext {
                         appContext = sessionContext
-                    } else if let inFlightContext = await inFlightContextTask?.value {
+                    } else if let inFlightContext = await Self.awaitContext(inFlightContextTask, budget: Self.contextWaitBudgetAtStop) {
                         appContext = inFlightContext
                     } else {
                         appContext = self.fallbackContextAtStop()
@@ -2981,7 +3002,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     let resolvedContext: AppContext
                     if let sessionContext {
                         resolvedContext = sessionContext
-                    } else if let inFlightContext = await inFlightContextTask?.value {
+                    } else if let inFlightContext = await Self.awaitContext(inFlightContextTask, budget: Self.contextWaitBudgetAtStop) {
                         resolvedContext = inFlightContext
                     } else {
                         resolvedContext = self.fallbackContextAtStop()
@@ -3133,6 +3154,42 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 self.handleScreenshotCaptureIssue(context.screenshotError)
             }
             return context
+        }
+    }
+
+    /// How long the stop→paste path may wait for the in-flight app-context task
+    /// (started at hotkey-down; includes an LLM round trip). Context is a
+    /// nice-to-have spelling/tone hint — a slow network must never delay the
+    /// dictation. Measured: a DNS flap on the hosted provider once turned a 0.4s
+    /// dictation into 3.9s purely from this await. Override with
+    /// `defaults write … context_wait_at_stop_ms N` (0 = don't wait at all).
+    static var contextWaitBudgetAtStop: TimeInterval {
+        let override = UserDefaults.standard.object(forKey: "context_wait_at_stop_ms") as? Double
+        return (override ?? 200) / 1000
+    }
+
+    /// Await `task` for at most `budget`; nil if it isn't done in time (the task
+    /// keeps running and is simply ignored).
+    static func awaitContext(_ task: Task<AppContext?, Never>?, budget: TimeInterval) async -> AppContext? {
+        guard let task else { return nil }
+        guard budget > 0 else { return nil }
+        // Unstructured on purpose: a task group would wait for the slow child at
+        // scope exit, which is exactly the wait we're bounding.
+        let resumed = OSAllocatedUnfairLock(initialState: false)
+        return await withCheckedContinuation { (cont: CheckedContinuation<AppContext?, Never>) in
+            func finish(_ value: AppContext?) {
+                let first = resumed.withLock { done -> Bool in
+                    if done { return false }
+                    done = true
+                    return true
+                }
+                if first { cont.resume(returning: value) }
+            }
+            Task { finish(await task.value) }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(budget * 1_000_000_000))
+                finish(nil)
+            }
         }
     }
 
