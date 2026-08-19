@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- FreeFlow local speech-to-text: Parakeet-TDT via parakeet-mlx (stt_server.py).
+     Serves /v1/audio/transcriptions AND the streaming /v1/realtime socket on
+     127.0.0.1:8082. Point FreeFlow's "Transcription API URL" at
+     http://127.0.0.1:8082/v1 and enable realtime streaming (see README).
+     Replace YOUR_USERNAME; the venv needs: pip install parakeet-mlx aiohttp scipy -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.freeflow.stt</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/.freeflow-ft/venv/bin/python</string>
+        <string>/Users/YOUR_USERNAME/.freeflow-stt/stt_server.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/YOUR_USERNAME</string>
+        <key>STT_MODEL</key>
+        <string>mlx-community/parakeet-tdt-0.6b-v2</string>
+        <key>STT_PORT</key>
+        <string>8082</string>
+        <key>STT_PAUSE_S</key>
+        <string>0.8</string>
+        <key>STT_MIN_SEGMENT_S</key>
+        <string>3.0</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.freeflow-stt/stt-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.freeflow-stt/stt-server.log</string>
+</dict>
+</plist>
