@@ -170,6 +170,7 @@ Behavior:
         let vocabularyTerms = mergedVocabularyTerms(rawVocabulary: customVocabulary)
 
         let timeoutSeconds = postProcessingTimeoutSeconds
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
         return try await withThrowingTaskGroup(of: PostProcessingResult.self) { group in
             group.addTask { [weak self] in
                 guard let self else {
@@ -180,7 +181,8 @@ Behavior:
                     contextSummary: context.contextSummary,
                     customVocabulary: vocabularyTerms,
                     customSystemPrompt: customSystemPrompt,
-                    outputLanguage: outputLanguage
+                    outputLanguage: outputLanguage,
+                    deadline: deadline
                 )
             }
 
@@ -273,6 +275,7 @@ Behavior:
         }
 
         let timeoutSeconds = postProcessingTimeoutSeconds
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
         return try await withThrowingTaskGroup(of: PostProcessingResult.self) { group in
             group.addTask { [weak self] in
                 guard let self else {
@@ -283,7 +286,8 @@ Behavior:
                     voiceCommand: voiceCommand,
                     contextSummary: context.contextSummary,
                     customVocabulary: vocabularyTerms,
-                    outputLanguage: outputLanguage
+                    outputLanguage: outputLanguage,
+                    deadline: deadline
                 )
             }
 
@@ -310,7 +314,8 @@ Behavior:
         contextSummary: String,
         customVocabulary: [String],
         customSystemPrompt: String = "",
-        outputLanguage: String = ""
+        outputLanguage: String = "",
+        deadline: Date
     ) async throws -> PostProcessingResult {
         var primaryModel = resolvedPrimaryModel()
         let retryModel = resolvedRetryModel(for: primaryModel)
@@ -330,7 +335,8 @@ Behavior:
                 model: primaryModel,
                 customVocabulary: customVocabulary,
                 customSystemPrompt: customSystemPrompt,
-                outputLanguage: outputLanguage
+                outputLanguage: outputLanguage,
+                deadline: deadline
             )
         } catch let error as PostProcessingError {
             // Unified fallback policy: decide whether to retry on the other model.
@@ -377,7 +383,8 @@ Behavior:
                     model: retryModel,
                     customVocabulary: customVocabulary,
                     customSystemPrompt: customSystemPrompt,
-                    outputLanguage: outputLanguage
+                    outputLanguage: outputLanguage,
+                    deadline: deadline
                 )
             } catch PostProcessingError.suspectedInstructionExecution {
                 return PostProcessingResult(
@@ -393,7 +400,8 @@ Behavior:
         voiceCommand: String,
         contextSummary: String,
         customVocabulary: [String],
-        outputLanguage: String = ""
+        outputLanguage: String = "",
+        deadline: Date
     ) async throws -> PostProcessingResult {
         var primaryModel = resolvedPrimaryModel()
         let retryModel = resolvedRetryModel(for: primaryModel)
@@ -412,7 +420,8 @@ Behavior:
                 contextSummary: contextSummary,
                 model: primaryModel,
                 customVocabulary: customVocabulary,
-                outputLanguage: outputLanguage
+                outputLanguage: outputLanguage,
+                deadline: deadline
             )
         } catch let error as PostProcessingError {
             // Unified fallback policy: decide whether to retry on the other model.
@@ -444,7 +453,8 @@ Behavior:
                 contextSummary: contextSummary,
                 model: retryModel,
                 customVocabulary: customVocabulary,
-                outputLanguage: outputLanguage
+                outputLanguage: outputLanguage,
+                deadline: deadline
             )
         }
     }
@@ -466,19 +476,65 @@ Behavior:
         return nil
     }
 
+    /// Header telling a FreeFlow-aware proxy (see local-setup/router.py) how much
+    /// wall-clock budget the app has left before it gives up and pastes the raw
+    /// transcript. The router uses it to skip backends that can't finish in time
+    /// instead of succeeding after the app has already hung up.
+    static let deadlineHeader = "X-FreeFlow-Deadline-Ms"
+
+    private func makeChatRequest(deadline: Date) throws -> URLRequest {
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0.25 else {
+            throw PostProcessingError.requestTimedOut(postProcessingTimeoutSeconds)
+        }
+        var request = URLRequest(url: URL(string: "\(baseURL)/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(String(Int(remaining * 1000)), forHTTPHeaderField: Self.deadlineHeader)
+        request.timeoutInterval = remaining
+        return request
+    }
+
+    /// Attach model-specific generation parameters. The completion budget is
+    /// sized to the input rather than fixed at the model cap — see
+    /// `ModelConfiguration.completionTokenBudget` for why (Groq TPM reservation).
+    private func applyModelParameters(
+        to payload: inout [String: Any],
+        config: ModelConfig,
+        model: String,
+        inputText: String
+    ) {
+        let completionCap = config.maxCompletionTokens
+            ?? (model == defaultModel ? postProcessingMaxCompletionTokens : nil)
+        if let completionCap {
+            payload["max_completion_tokens"] = ModelConfiguration.completionTokenBudget(
+                inputText: inputText,
+                cap: completionCap
+            )
+        }
+        if let effort = config.reasoningEffort {
+            payload["reasoning_effort"] = effort
+        } else if model == defaultModel {
+            payload["reasoning_effort"] = defaultModelReasoningEffort
+        }
+        if let include = config.includeReasoning {
+            payload["include_reasoning"] = include
+        } else if model == defaultModel {
+            payload["include_reasoning"] = false
+        }
+    }
+
     private func process(
         transcript: String,
         contextSummary: String,
         model: String,
         customVocabulary: [String],
         customSystemPrompt: String = "",
-        outputLanguage: String = ""
+        outputLanguage: String = "",
+        deadline: Date
     ) async throws -> PostProcessingResult {
-        var request = URLRequest(url: URL(string: "\(baseURL)/chat/completions")!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = postProcessingTimeoutSeconds
+        var request = try makeChatRequest(deadline: deadline)
 
         let normalizedVocabulary = normalizedVocabularyText(customVocabulary)
         let vocabularyPrompt = if !normalizedVocabulary.isEmpty {
@@ -538,21 +594,7 @@ Model: \(model)
             ]
         ]
         let config = ModelConfiguration.config(for: model)
-        if let maxTokens = config.maxCompletionTokens {
-            payload["max_completion_tokens"] = maxTokens
-        } else if model == defaultModel {
-            payload["max_completion_tokens"] = postProcessingMaxCompletionTokens
-        }
-        if let effort = config.reasoningEffort {
-            payload["reasoning_effort"] = effort
-        } else if model == defaultModel {
-            payload["reasoning_effort"] = defaultModelReasoningEffort
-        }
-        if let include = config.includeReasoning {
-            payload["include_reasoning"] = include
-        } else if model == defaultModel {
-            payload["include_reasoning"] = false
-        }
+        applyModelParameters(to: &payload, config: config, model: model, inputText: transcript)
 
         request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
 
@@ -612,13 +654,10 @@ Model: \(model)
         contextSummary: String,
         model: String,
         customVocabulary: [String],
-        outputLanguage: String = ""
+        outputLanguage: String = "",
+        deadline: Date
     ) async throws -> PostProcessingResult {
-        var request = URLRequest(url: URL(string: "\(baseURL)/chat/completions")!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = postProcessingTimeoutSeconds
+        var request = try makeChatRequest(deadline: deadline)
 
         let normalizedVocabulary = normalizedVocabularyText(customVocabulary)
         let vocabularyPrompt = if !normalizedVocabulary.isEmpty {
@@ -678,21 +717,12 @@ Model: \(model)
             ]
         ]
         let config = ModelConfiguration.config(for: model)
-        if let maxTokens = config.maxCompletionTokens {
-            payload["max_completion_tokens"] = maxTokens
-        } else if model == defaultModel {
-            payload["max_completion_tokens"] = postProcessingMaxCompletionTokens
-        }
-        if let effort = config.reasoningEffort {
-            payload["reasoning_effort"] = effort
-        } else if model == defaultModel {
-            payload["reasoning_effort"] = defaultModelReasoningEffort
-        }
-        if let include = config.includeReasoning {
-            payload["include_reasoning"] = include
-        } else if model == defaultModel {
-            payload["include_reasoning"] = false
-        }
+        applyModelParameters(
+            to: &payload,
+            config: config,
+            model: model,
+            inputText: selectedText + " " + voiceCommand
+        )
 
         request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
 

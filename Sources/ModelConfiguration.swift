@@ -170,6 +170,22 @@ public struct ModelConfiguration {
         )
     }
     
+    /// Completion-token budget for a request whose input text is `inputText`.
+    ///
+    /// Groq reserves `max_completion_tokens` against the per-minute token limit
+    /// *before* generating (a 429 reads "Used 3178, Requested 5573" for a 1.5k
+    /// prompt + 4096 budget), so a fixed 4096 on a 30-word cleanup burns most of
+    /// the free tier's 8k TPM per request and the *next* dictation gets rate
+    /// limited. Cleanup output is roughly the size of its input, so budget
+    /// proportionally — with headroom for low-effort reasoning tokens — and only
+    /// clamp at the model's hard cap.
+    public static func completionTokenBudget(inputText: String, cap: Int) -> Int {
+        // ~3 chars/token is deliberately conservative (non-English, punctuation-heavy).
+        let estimatedInputTokens = max(1, (inputText.count + 2) / 3)
+        let proportional = 256 + estimatedInputTokens * 3
+        return max(1, min(cap, max(256, proportional)))
+    }
+
     /// Utility method to remove <think>...</think> tags and everything inside them.
     /// This also handles unclosed tags gracefully (e.g. if the model runs out of tokens).
     public static func stripThinkTags(_ text: String) -> String {

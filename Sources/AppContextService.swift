@@ -218,6 +218,10 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             var request = URLRequest(url: URL(string: "\(baseURL)/chat/completions")!)
             request.httpMethod = "POST"
             request.timeoutInterval = contextRequestTimeoutSeconds
+            request.setValue(
+                String(Int(contextRequestTimeoutSeconds * 1000)),
+                forHTTPHeaderField: PostProcessingService.deadlineHeader
+            )
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -254,9 +258,13 @@ Selected text: \(selectedText ?? "None")
 
             let fullPrompt = "Model: \(model)\n\n[System]\n\(contextSystemPrompt)\n[User]\n\(userMessageDescription)"
 
+            // Two sentences of activity summary never need more than this, and
+            // Groq reserves the completion budget against the per-minute token
+            // limit — an uncapped request would otherwise compete with cleanup.
             let payload: [String: Any] = [
                 "model": model,
                 "temperature": 0.2,
+                "max_completion_tokens": 512,
                 "messages": [
                     ["role": "system", "content": contextSystemPrompt],
                     ["role": "user", "content": userMessage]
