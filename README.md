@@ -118,6 +118,10 @@ The timeout keys are:
 - `post_processing_timeout_seconds`: transcript cleanup and edit mode requests
 - `context_request_timeout_seconds`: nearby app context requests
 
+Related hidden key: `clean_transcript_fast_path_max_words` (default 12) — transcripts up to
+this many words that already look clean (no fillers/self-corrections/spoken punctuation)
+are pasted immediately without the LLM round trip; `0` disables.
+
 Only positive values are used. Remove a custom timeout to return to the 20-second default:
 
 ```bash
