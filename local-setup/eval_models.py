@@ -40,10 +40,13 @@ EXAMPLES
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
+import threading
 import time
+import urllib.error
 import urllib.request
 
 
@@ -89,8 +92,74 @@ def cer(pred, gold):
     return _levenshtein(p, g) / len(g)
 
 
+_WORD = re.compile(r"[a-z0-9_/'-]+")
+
+
+def _wordset(s):
+    return set(_WORD.findall(s.lower()))
+
+
+def insertion(pred, raw, gold):
+    """Fraction of predicted words that appear in NEITHER the raw transcript nor
+    the gold text — i.e. content the model made up (hallucinated names, dates,
+    context leaking into the output, prompt examples being parroted)."""
+    p = _wordset(pred)
+    if not p:
+        return 0.0
+    allowed = _wordset(raw) | _wordset(gold)
+    return len(p - allowed) / len(p)
+
+
+def leaked(pred, forbidden):
+    """True if any forbidden phrase (case-insensitive) shows up in the prediction."""
+    low = pred.lower()
+    return any(f.lower() in low for f in (forbidden or []))
+
+
 def exact(pred, gold):
     return _normalize(pred).lower() == _normalize(gold).lower()
+
+
+# ----------------------------------------------------------------------------
+# prompt formats — "app" is byte-for-byte what FreeFlow sends at runtime
+# (PostProcessingService.process); "train" is what export_training_data.py /
+# gen_synthetic_data.py wrote, i.e. what the local fine-tune saw. Evaluating a
+# model in the wrong format is a real production bug, so both are first-class.
+# ----------------------------------------------------------------------------
+def user_message(fmt, raw, context):
+    if fmt == "app":
+        return (
+            "Instructions: Clean up RAW_TRANSCRIPTION and return only the cleaned transcript "
+            "text without surrounding quotes. Return EMPTY if there should be no result.\n\n"
+            f'CONTEXT: "{context or ""}"\n\n'
+            f'RAW_TRANSCRIPTION: "{raw}"'
+        )
+    parts = [f"Raw transcript:\n{raw.strip()}"]
+    if context and context.strip():
+        parts.append("Context: context: " + context.strip())
+    parts.append("Clean this up into the final text.")
+    return "\n\n".join(parts)
+
+
+def completion_budget(input_text, cap=4096):
+    """Mirror of ModelConfiguration.completionTokenBudget in the app."""
+    est = max(1, (len(input_text) + 2) // 3)
+    return max(1, min(cap, max(256, 256 + est * 3)))
+
+
+def request_params(model, input_text):
+    """Generation params per model family, mirroring the app + router."""
+    m = model.lower()
+    body = {"temperature": 0.0}
+    if m.startswith("openai/gpt-oss"):
+        body.update({"max_completion_tokens": completion_budget(input_text),
+                     "reasoning_effort": "low", "include_reasoning": False})
+    elif m.startswith("qwen/"):
+        body.update({"max_completion_tokens": completion_budget(input_text),
+                     "reasoning_effort": "none"})
+    else:
+        body["max_tokens"] = completion_budget(input_text)
+    return body
 
 
 # ----------------------------------------------------------------------------
@@ -130,11 +199,12 @@ class MLXModel:
         try:
             from mlx_lm.sample_utils import make_sampler
             out = self._generate(self.model, self.tokenizer, prompt=prompt,
-                                 max_tokens=512, sampler=make_sampler(temp=0.0),
-                                 verbose=False)
+                                 max_tokens=completion_budget(messages[-1]["content"]),
+                                 sampler=make_sampler(temp=0.0), verbose=False)
         except Exception:
             out = self._generate(self.model, self.tokenizer, prompt=prompt,
-                                 max_tokens=512, verbose=False)
+                                 max_tokens=completion_budget(messages[-1]["content"]),
+                                 verbose=False)
         return out.strip()
 
 
@@ -146,20 +216,43 @@ class EndpointModel:
         if api_key_env and not self.api_key:
             sys.exit(f"${api_key_env} not set (needed for endpoint {label}).")
 
+        self.rate_limited = 0
+
     def predict(self, messages, raw):
-        body = json.dumps({"model": self.model, "messages": messages,
-                           "temperature": 0.0}).encode()
-        req = urllib.request.Request(self.url, data=body,
-                                     headers={"Content-Type": "application/json"})
-        if self.api_key:
-            req.add_header("Authorization", f"Bearer {self.api_key}")
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.load(resp)
-        return data["choices"][0]["message"]["content"].strip()
+        payload = {"model": self.model, "messages": messages}
+        payload.update(request_params(self.model, messages[-1]["content"]))
+        body = json.dumps(payload).encode()
+        for attempt in range(6):
+            req = urllib.request.Request(self.url, data=body,
+                                         headers={"Content-Type": "application/json",
+                                                  "User-Agent": "FreeFlow-Eval/1.0"})
+            if self.api_key:
+                req.add_header("Authorization", f"Bearer {self.api_key}")
+            t0 = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.load(resp)
+                # Latency of the call that actually answered — quota waits are
+                # reported in the 429 column, not smeared into p50/p95.
+                self.last_latency = time.time() - t0
+                return data["choices"][0]["message"]["content"].strip()
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 5:
+                    # Free-tier TPM bucket; wait it out so we measure the model,
+                    # not the quota. Counted separately.
+                    self.rate_limited += 1
+                    wait = float(e.headers.get("retry-after") or 5) + 0.5
+                    time.sleep(min(wait, 60))
+                    continue
+                raise
+        raise RuntimeError("gave up after repeated 429s")
 
 
 # ----------------------------------------------------------------------------
-def load_test(path):
+def load_test(path, fmt, system_prompt=None):
+    """Rows: {input, raw, gold, forbidden}. The system prompt is taken from the
+    file's first row (exported from the app) unless overridden; the user turn is
+    REBUILT in `fmt` from raw+context so we test the format production uses."""
     rows = []
     with open(path) as f:
         for line in f:
@@ -167,38 +260,68 @@ def load_test(path):
             if not line:
                 continue
             ex = json.loads(line)
-            # messages WITHOUT the gold assistant turn = the model's input
-            msgs = [m for m in ex["messages"] if m["role"] != "assistant"]
-            rows.append({"input": msgs, "raw": ex["raw"], "gold": ex["gold"]})
-    return rows
+            msgs = ex.get("messages") or []
+            sys_msg = next((m["content"] for m in msgs if m["role"] == "system"), None)
+            if system_prompt is None and sys_msg:
+                system_prompt = sys_msg
+            raw, gold = ex["raw"], ex["gold"]
+            context = ex.get("context", "")
+            rows.append({
+                "input": [{"role": "system", "content": system_prompt or ""},
+                          {"role": "user", "content": user_message(fmt, raw, context)}],
+                "raw": raw, "gold": gold, "context": context,
+                "forbidden": ex.get("forbidden", []),
+            })
+    return rows, system_prompt
+
+
+def _pct(xs, q):
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    k = max(0, min(len(xs) - 1, int(math.ceil(q * len(xs))) - 1))
+    return xs[k]
+
+
+_DIFF_LOCK = threading.Lock()
 
 
 def evaluate(runner, test, worst_out=None):
-    wers, cers, exacts, lats = [], [], [], []
+    wers, cers, exacts, lats, ins, leaks, errors = [], [], [], [], [], 0, 0
     diffs = []
     for ex in test:
         t0 = time.time()
+        runner.last_latency = None
         try:
             pred = runner.predict(ex["input"], ex["raw"])
         except Exception as e:
             pred = f"<ERROR: {e}>"
-        lats.append(time.time() - t0)
+            errors += 1
+        lats.append(runner.last_latency if runner.last_latency is not None else time.time() - t0)
         w, c, x = wer(pred, ex["gold"]), cer(pred, ex["gold"]), exact(pred, ex["gold"])
-        wers.append(w); cers.append(c); exacts.append(x)
-        diffs.append((w, ex["raw"], pred, ex["gold"]))
+        i, lk = insertion(pred, ex["raw"], ex["gold"]), leaked(pred, ex["forbidden"])
+        wers.append(w); cers.append(c); exacts.append(x); ins.append(i); leaks += lk
+        diffs.append((w + i + (1.0 if lk else 0.0), w, i, lk, ex["raw"], ex["context"], pred, ex["gold"]))
     n = max(1, len(test))
     if worst_out is not None:
         diffs.sort(key=lambda d: -d[0])
-        with open(worst_out, "a") as f:
-            f.write(f"\n===== {runner.label} — worst {min(5, len(diffs))} =====\n")
-            for w, raw, pred, gold in diffs[:5]:
-                f.write(f"[wer={w:.2f}]\n  raw : {raw}\n  pred: {pred}\n  gold: {gold}\n")
+        with _DIFF_LOCK, open(worst_out, "a") as f:
+            f.write(f"\n===== {runner.label} — worst {min(6, len(diffs))} =====\n")
+            for _, w, i, lk, raw, ctx, pred, gold in diffs[:6]:
+                f.write(f"[wer={w:.2f} ins={i:.2f}{' LEAK' if lk else ''}]\n"
+                        f"  raw : {raw}\n" + (f"  ctx : {ctx}\n" if ctx else "") +
+                        f"  pred: {pred}\n  gold: {gold}\n")
     return {
         "label": runner.label,
         "wer": sum(wers) / n,
         "cer": sum(cers) / n,
         "exact": sum(exacts) / n,
-        "lat": sum(lats) / n,
+        "ins": sum(ins) / n,
+        "leak": leaks,
+        "errors": errors,
+        "p50": _pct(lats, 0.5),
+        "p95": _pct(lats, 0.95),
+        "rl": getattr(runner, "rate_limited", 0),
     }
 
 
@@ -207,10 +330,22 @@ def main():
     ap.add_argument("--test", default=os.path.expanduser("~/.freeflow-ft/test.jsonl"))
     ap.add_argument("--mlx", action="append", default=[],
                     help="MLX model, repeatable. 'PATH' or 'PATH@ADAPTER_PATH'")
-    ap.add_argument("--endpoint", help="OpenAI-compatible /chat/completions URL")
-    ap.add_argument("--endpoint-model", help="model name for --endpoint")
-    ap.add_argument("--endpoint-label", default="endpoint")
-    ap.add_argument("--api-key-env", help="env var holding the endpoint API key")
+    ap.add_argument("--endpoint", action="append", default=[],
+                    help="OpenAI-compatible /chat/completions URL (repeatable; pair with the "
+                         "Nth --endpoint-model / --endpoint-label / --api-key-env)")
+    ap.add_argument("--endpoint-model", action="append", default=[], help="model name for --endpoint")
+    ap.add_argument("--endpoint-label", action="append", default=[])
+    ap.add_argument("--api-key-env", action="append", default=[],
+                    help="env var holding the endpoint API key ('' / '-' for none)")
+    ap.add_argument("--format", choices=["app", "train"], default="app",
+                    help="how to build the user turn: 'app' = exactly what FreeFlow sends "
+                         "in production (default); 'train' = the fine-tune's training format")
+    ap.add_argument("--probes", action="append", default=[],
+                    help="extra jsonl of {raw, gold, context, forbidden} hallucination probes "
+                         "(repeatable). 'leak' counts predictions containing a forbidden phrase.")
+    ap.add_argument("--parallel", action="store_true",
+                    help="run models concurrently (each model still sequential). Use for "
+                         "hosted models that sit in separate rate-limit buckets.")
     ap.add_argument("--no-floor", action="store_true", help="skip the raw-transcript floor")
     ap.add_argument("--diffs", default="/tmp/freeflow-eval-diffs.txt",
                     help="write each model's worst examples here for inspection")
@@ -219,11 +354,17 @@ def main():
     if not os.path.exists(args.test):
         sys.exit(f"test set not found: {args.test}\n"
                  f"run: python3 export_training_data.py --split-dir ~/.freeflow-ft")
-    test = load_test(args.test)
+    test, system_prompt = load_test(args.test, args.format)
     if not test:
         sys.exit("test set is empty — collect more gold corrections first "
                  "(the test split only draws from human-corrected rows).")
-    print(f"test set: {len(test)} held-out gold examples\n")
+    n_probes = 0
+    for pth in args.probes:
+        probes, _ = load_test(pth, args.format, system_prompt=system_prompt)
+        test.extend(probes)
+        n_probes += len(probes)
+    print(f"test set: {len(test) - n_probes} held-out gold examples + {n_probes} probes, "
+          f"format={args.format}\n")
     open(args.diffs, "w").close()
 
     runners = []
@@ -231,30 +372,47 @@ def main():
         runners.append(RawFloor())
     for spec in args.mlx:
         runners.append(MLXModel(spec))
-    if args.endpoint:
-        if not args.endpoint_model:
-            sys.exit("--endpoint requires --endpoint-model")
-        runners.append(EndpointModel(args.endpoint, args.endpoint_model,
-                                     args.endpoint_label, args.api_key_env))
+    if len(args.endpoint) != len(args.endpoint_model):
+        sys.exit("each --endpoint needs a matching --endpoint-model")
+    for i, url in enumerate(args.endpoint):
+        label = args.endpoint_label[i] if i < len(args.endpoint_label) else args.endpoint_model[i]
+        key_env = args.api_key_env[i] if i < len(args.api_key_env) else None
+        if key_env in ("", "-"):
+            key_env = None
+        runners.append(EndpointModel(url, args.endpoint_model[i], label, key_env))
     if not runners:
         sys.exit("nothing to evaluate — pass --mlx and/or --endpoint")
 
-    results = []
-    for r in runners:
+    results = [None] * len(runners)
+
+    def run(i, r):
         print(f"  running {r.label} ...", flush=True)
-        results.append(evaluate(r, test, worst_out=args.diffs))
+        results[i] = evaluate(r, test, worst_out=args.diffs)
+        print(f"  done    {r.label}", flush=True)
+
+    if args.parallel:
+        threads = [threading.Thread(target=run, args=(i, r)) for i, r in enumerate(runners)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    else:
+        for i, r in enumerate(runners):
+            run(i, r)
 
     # lower WER is better; the floor stays first for reference
-    print("\n" + "=" * 74)
-    print(f"{'model':<40}{'WER↓':>8}{'CER↓':>8}{'exact↑':>9}{'s/ex':>8}")
-    print("-" * 74)
+    print("\n" + "=" * 100)
+    print(f"{'model':<34}{'p50s':>7}{'p95s':>7}{'WER↓':>8}{'CER↓':>8}{'exact↑':>8}{'ins↓':>7}{'leak':>6}{'err':>5}{'429':>5}")
+    print("-" * 100)
     for res in results:
-        print(f"{res['label']:<40}{res['wer']*100:>7.1f}%{res['cer']*100:>7.1f}%"
-              f"{res['exact']*100:>8.0f}%{res['lat']:>8.2f}")
-    print("=" * 74)
-    print(f"\nWER/CER = avg distance to YOUR kept text (lower=better). "
-          f"A model is worth shipping when its WER is well under the raw floor and "
-          f"near the gpt-oss bar.\nWorst-case examples per model: {args.diffs}")
+        print(f"{res['label']:<34}{res['p50']:>7.2f}{res['p95']:>7.2f}{res['wer']*100:>7.1f}%"
+              f"{res['cer']*100:>7.1f}%{res['exact']*100:>7.0f}%{res['ins']*100:>6.1f}%"
+              f"{res['leak']:>6}{res['errors']:>5}{res['rl']:>5}")
+    print("=" * 100)
+    print(f"\np50/p95 = latency per example (speed first). WER/CER = distance to the kept text. "
+          f"ins = share of output words present in neither raw nor gold (made-up content). "
+          f"leak = probes whose output contains a forbidden context/prompt phrase.\n"
+          f"Worst-case examples per model: {args.diffs}")
 
 
 if __name__ == "__main__":
