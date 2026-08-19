@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Replace YOUR_USERNAME, then place in ~/Library/LaunchAgents/. RAM-capped for ~24GB Macs. -->
+<!-- Replace YOUR_USERNAME, then place in ~/Library/LaunchAgents/. RAM-capped for ~24GB Macs.
+     Runs through start-ollama.sh so it steps aside (exit 0, no restart loop) if the
+     Ollama desktop app already owns the port. Copy start-ollama.sh next to router.py. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -7,8 +9,8 @@
     <string>com.freeflow.ollama</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/ollama</string>
-        <string>serve</string>
+        <string>/bin/bash</string>
+        <string>/Users/YOUR_USERNAME/.freeflow-stt/start-ollama.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -20,8 +22,11 @@
         <string>1</string>
         <key>OLLAMA_NUM_PARALLEL</key>
         <string>1</string>
+        <!-- Keep the fallback model resident between dictations: a cold load of an
+             8B model is ~8s, which is most of FreeFlow's 20s budget. Match
+             LOCAL_KEEPALIVE_S in com.freeflow.router.plist. -->
         <key>OLLAMA_KEEP_ALIVE</key>
-        <string>2m</string>
+        <string>30m</string>
         <key>OLLAMA_CONTEXT_LENGTH</key>
         <string>8192</string>
         <key>OLLAMA_MAX_QUEUE</key>
@@ -34,7 +39,11 @@
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <!-- Restart only if it crashes; a clean exit means "someone else is serving". -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>

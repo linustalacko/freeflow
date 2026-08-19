@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Serves the on-device fine-tuned cleanup model (see HOW_IT_WORKS.md /
+     finetune_local.sh) as an OpenAI-compatible endpoint on 127.0.0.1:8081 via
+     mlx_lm. Always resident (~1GB), ~0.4s per cleanup, no cold start.
+     Replace YOUR_USERNAME; point --adapter-path at your trained adapters. (Do NOT
+     fuse into the 4-bit base — measured lossy: WER 14% → 29%. See README.) Then in
+     com.freeflow.router.plist set:
+       LOCAL_URL=http://127.0.0.1:8081/v1/chat/completions
+       LOCAL_MODEL=mlx-community/Qwen2.5-1.5B-Instruct-4bit   (must match --model exactly)
+       LOCAL_PROMPT_FORMAT=train
+     Requests must name the exact --model id; anything else 404s. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.freeflow.localmodel</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/.freeflow-ft/venv/bin/python</string>
+        <string>-m</string>
+        <string>mlx_lm</string>
+        <string>server</string>
+        <string>--model</string>
+        <string>mlx-community/Qwen2.5-1.5B-Instruct-4bit</string>
+        <string>--adapter-path</string>
+        <string>/Users/YOUR_USERNAME/.freeflow-ft/syn-frontier/adapters</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8081</string>
+        <string>--log-level</string>
+        <string>WARNING</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.freeflow-ft/localmodel.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.freeflow-ft/localmodel.log</string>
+</dict>
+</plist>
