@@ -30,7 +30,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_stt_server import run_session  # noqa: E402  (drives the realtime protocol)
-from detclean import det_clean  # noqa: E402  (mirror of the app's TranscriptFastPath)
+from detclean import det_clean, profile_for  # noqa: E402  (mirror of the app's TranscriptFastPath)
 
 STT_URL = os.environ.get("STT_URL", "http://127.0.0.1:8082")
 ROUTER_URL = os.environ.get("ROUTER_URL", "http://127.0.0.1:11435")
@@ -79,6 +79,9 @@ async def main():
     ap.add_argument("--no-pace", action="store_true")
     ap.add_argument("--label", default="")
     ap.add_argument("--skip-cleanup", action="store_true")
+    ap.add_argument("--target", default="unknown",
+                    help="destination profile for the deterministic fast path "
+                         "(email, chat, code, terminal, document, searchField, unknown)")
     args = ap.parse_args()
     files = sorted(glob.glob(AUDIO_DIR + "/*.wav"), key=os.path.getmtime)[-args.files:]
     port = int(STT_URL.rsplit(":", 1)[1])
@@ -95,7 +98,7 @@ async def main():
             cl, ct, route = "", 0.0, "-"
         else:
             t0 = time.monotonic()
-            cl = det_clean(text)  # the app skips the LLM for these (TranscriptFastPath)
+            cl = det_clean(text, profile=profile_for(args.target))  # the app skips the LLM for these (TranscriptFastPath)
             if cl is not None:
                 ct, route = time.monotonic() - t0, "fast-path"
             else:
