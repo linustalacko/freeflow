@@ -51,9 +51,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from detclean import det_clean  # deterministic cleanup twin of TranscriptFastPath.swift
+    # deterministic cleanup twin of TranscriptFastPath/SpokenFormatting/DictationProfile
+    from detclean import det_clean, profile_from_system_prompt
 except Exception:  # pragma: no cover
-    def det_clean(raw, max_words=60, vocabulary=""):
+    def det_clean(raw, max_words=60, vocabulary="", profile=None):
+        return None
+
+    def profile_from_system_prompt(system_prompt):
         return None
 import threading
 import time
@@ -480,7 +484,8 @@ def clean_chunk(text, system_prompt, context="", timeout=60):
     Deterministic only under the app's default system prompt — a custom prompt
     means the user wants the model's judgement, so we give it to them."""
     if DET_CLEAN and (system_prompt or "").lstrip().startswith(_DEFAULT_PROMPT_HEAD):
-        d = det_clean(text, vocabulary=_vocab_from_system_prompt(system_prompt))
+        d = det_clean(text, vocabulary=_vocab_from_system_prompt(system_prompt),
+                      profile=profile_from_system_prompt(system_prompt))
         if d is not None:
             return d, "det"
     out = sanitize_cleanup_output(_local_generate(_cleanup_messages_for(text, system_prompt, context),
