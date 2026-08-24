@@ -220,7 +220,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             request.timeoutInterval = contextRequestTimeoutSeconds
             request.setValue(
                 String(Int(contextRequestTimeoutSeconds * 1000)),
-                forHTTPHeaderField: PostProcessingService.deadlineHeader
+                forHTTPHeaderField: LLMAPITransport.deadlineHeader
             )
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")

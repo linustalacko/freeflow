@@ -1,6 +1,11 @@
 import Foundation
 
 enum LLMAPITransport {
+    /// Remaining-time budget header the local router honors on every LLM call.
+    /// Lives here (not in a service) because multiple services send it and the
+    /// test target links this file without the services.
+    static let deadlineHeader = "X-FreeFlow-Deadline-Ms"
+
     private static func makeEphemeralSession(timeout: TimeInterval) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData

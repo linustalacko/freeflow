@@ -480,8 +480,6 @@ Behavior:
     /// wall-clock budget the app has left before it gives up and pastes the raw
     /// transcript. The router uses it to skip backends that can't finish in time
     /// instead of succeeding after the app has already hung up.
-    static let deadlineHeader = "X-FreeFlow-Deadline-Ms"
-
     private func makeChatRequest(deadline: Date) throws -> URLRequest {
         let remaining = deadline.timeIntervalSinceNow
         guard remaining > 0.25 else {
@@ -491,7 +489,7 @@ Behavior:
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(String(Int(remaining * 1000)), forHTTPHeaderField: Self.deadlineHeader)
+        request.setValue(String(Int(remaining * 1000)), forHTTPHeaderField: LLMAPITransport.deadlineHeader)
         request.timeoutInterval = remaining
         return request
     }
