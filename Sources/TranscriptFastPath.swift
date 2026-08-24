@@ -4,14 +4,18 @@ import Foundation
 ///
 /// Modern STT (Parakeet, Whisper) already punctuates and capitalises, so on real
 /// transcripts the model's job is mostly: strip "um/uh", collapse a stuttered
-/// word, convert a dictated "comma", tidy capitalisation. Those are mechanical —
-/// this does them in ~0ms. Measured against the LLM's own output on real run-log
-/// transcripts: identical words on every transcript it accepts, and it *bails* to
-/// the model for anything that needs interpretation:
+/// word, convert a dictated "comma", lay out the bullets you asked for, tidy
+/// capitalisation. Those are mechanical — this does them in ~0ms. Measured
+/// against the LLM's own output on real run-log transcripts: identical words on
+/// every transcript it accepts, and it *bails* to the model for anything that
+/// needs interpretation:
 ///   • self-corrections / restarts ("no actually", "I mean", "wait", a phrase that
 ///     restarts: "is there anything is there any way")
-///   • dictated formatting (new paragraph, bullets, brackets, quotes, underscore…)
-///   • an email-style greeting (the model lays out salutation + blank line)
+///   • dictated formatting whose reading is ambiguous — `SpokenFormatting`
+///     resolves lists, breaks, and quotes when it can and reports ambiguity
+///     when it can't ("a new line of business" is not a line break)
+///   • dictated syntax this layer doesn't convert (brackets, underscore, "period")
+///   • an email-style greeting, when the target app is a mail client
 ///   • a vocabulary term present with the wrong casing/spelling
 ///   • more than `maxWords` words (`clean_transcript_fast_path_max_words`; 0 = off)
 /// The caller also skips this path when a custom system prompt or output
@@ -27,12 +31,15 @@ enum TranscriptFastPath {
 
     /// Anything the model has to *interpret* → bail. Matched on lowercased,
     /// punctuation-stripped word sequences.
+    ///
+    /// List, break, and quote words are absent on purpose: `SpokenFormatting`
+    /// converts those when their reading is unambiguous and reports ambiguity
+    /// otherwise, which bails us out through the same door with a better hit rate.
     private static let bailPhrases: [String] = [
         "no actually", "actually no", "i mean", "scratch that", "never mind", "nevermind",
         "wait", "sorry", "not that", "let me rephrase", "start over", "strike that", "correction",
-        "new paragraph", "new line", "newline", "bullet", "bullets", "bullet point", "bullet points",
-        "numbered list", "bullet list", "open paren", "close paren", "open bracket", "close bracket",
-        "quote", "unquote", "colon", "semicolon", "underscore", "dash dash", "all caps", "slash", "hyphen",
+        "open paren", "close paren", "open bracket", "close bracket",
+        "colon", "semicolon", "underscore", "dash dash", "all caps", "slash", "hyphen",
         "period",  // "trial period" vs a dictated full stop — let the model decide
     ]
 
@@ -49,15 +56,12 @@ enum TranscriptFastPath {
 
     /// Returns the cleaned text to paste, or nil if the transcript should go
     /// through LLM post-processing.
-    /// Bundle identifiers / app names for which a leading greeting means "lay
-    /// this out as an email" (the model puts the salutation on its own line).
-    static func looksLikeEmailTarget(bundleIdentifier: String?, appName: String?) -> Bool {
-        let hay = ((bundleIdentifier ?? "") + " " + (appName ?? "")).lowercased()
-        return ["mail", "outlook", "gmail", "spark", "superhuman", "airmail", "postbox", "thunderbird", "hey.com", "front", "missive"]
-            .contains { hay.contains($0) }
-    }
-
-    static func cleanedIfAlreadyClean(_ raw: String, maxWords: Int, vocabulary: String, emailTarget: Bool = true) -> String? {
+    static func cleanedIfAlreadyClean(
+        _ raw: String,
+        maxWords: Int,
+        vocabulary: String,
+        profile: DictationProfile
+    ) -> String? {
         guard maxWords > 0 else { return nil }
         // STT emits mid-sentence line breaks; the model would join them.
         var text = raw
@@ -67,7 +71,7 @@ enum TranscriptFastPath {
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        guard !text.contains(where: { "\"([{".contains($0) }) else { return nil }
+        guard !text.contains(where: { "([{".contains($0) }) else { return nil }
 
         let words = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         guard words.count <= maxWords else { return nil }
@@ -78,7 +82,7 @@ enum TranscriptFastPath {
         }
         // A greeting only needs the model's email layout when we're in a mail app;
         // "Hello, hello, what is the time?" in a chat box is just text.
-        if emailTarget {
+        if profile.wantsEmailLayout {
             for g in greetings where joined.hasPrefix(" " + g + " ") {
                 return nil
             }
@@ -87,30 +91,60 @@ enum TranscriptFastPath {
         if hasRepeatedSentence(text) { return nil }
         if vocabularyMismatch(text: text, joinedCores: joined, vocabulary: vocabulary) { return nil }
 
+        // Dictated lists, line breaks, and quotes. Bails us to the model when the
+        // reading is ambiguous rather than guessing at layout.
+        let formatted = SpokenFormatting.apply(text, profile: profile)
+        guard formatted.confident else { return nil }
+        text = formatted.text
+        // A straight double quote surviving here came from the STT, not from
+        // `SpokenFormatting` (which emits curly quotes) — the model handles those.
+        guard !text.contains("\"") else { return nil }
+
         // --- transform ---
         for (word, mark) in punctuationWords {
             text = replaceWord(word, with: mark, in: text)
         }
-        var out: [String] = []
-        for token in text.split(whereSeparator: { $0.isWhitespace }).map(String.init) {
-            if fillerWords.contains(core(token)) {
-                // "Um." at the end of a sentence: keep the sentence-ending mark.
-                if let last = token.last, sentenceEnders.contains(last),
-                   let prev = out.last, let prevLast = prev.last, !sentenceEnders.contains(prevLast) {
-                    out[out.count - 1] = prev + String(last)
-                }
-                continue
-            }
-            out.append(token)
-        }
-        text = out.joined(separator: " ")
+        text = removingFillers(from: text)
         text = tidyPunctuation(text)
         guard !text.isEmpty else { return nil }
-        text = capitalizeSentences(text)
-        if let last = text.last, !sentenceEnders.contains(last) {
-            text += "."
+        // Sentence-casing a shell command corrupts it: `git status` is not `Git
+        // status`, and a launcher query is not a sentence either.
+        if !profile.preservesVerbatim {
+            text = capitalizeSentences(text)
         }
-        return text
+        text = applyTerminalPunctuation(text, profile: profile, isList: formatted.producedList)
+        return text.isEmpty ? nil : text
+    }
+
+    /// Strips filler words line by line so a formatted list keeps its layout.
+    private static func removingFillers(from text: String) -> String {
+        text.components(separatedBy: "\n").map { line -> String in
+            var out: [String] = []
+            for token in line.split(whereSeparator: { $0.isWhitespace }).map(String.init) {
+                if fillerWords.contains(core(token)) {
+                    // "Um." at the end of a sentence: keep the sentence-ending mark.
+                    if let last = token.last, sentenceEnders.contains(last),
+                       let prev = out.last, let prevLast = prev.last, !sentenceEnders.contains(prevLast) {
+                        out[out.count - 1] = prev + String(last)
+                    }
+                    continue
+                }
+                out.append(token)
+            }
+            return out.joined(separator: " ")
+        }.joined(separator: "\n")
+    }
+
+    /// Adds the closing full stop, except where it would be wrong: shell
+    /// commands and search queries take none, chat messages read better without
+    /// one on a single short line, and list items are not sentences.
+    private static func applyTerminalPunctuation(_ text: String, profile: DictationProfile, isList: Bool) -> String {
+        guard !profile.preservesVerbatim, !isList else { return text }
+        guard let last = text.last, !sentenceEnders.contains(last) else { return text }
+        if profile.isCasual && !text.contains(where: { sentenceEnders.contains($0) }) {
+            return text
+        }
+        return text + "."
     }
 
     // MARK: - Detection
@@ -187,12 +221,16 @@ enum TranscriptFastPath {
 
     private static func tidyPunctuation(_ input: String) -> String {
         var text = input
+        // Horizontal whitespace only: `\s` would eat the newlines that
+        // `SpokenFormatting` just produced for lists and paragraph breaks.
         let rules: [(String, String)] = [
-            ("\\s+([,.!?;:])", "$1"),          // no space before marks
+            ("[ \\t]+([,.!?;:])", "$1"),        // no space before marks
             ("[,;:]([.!?])", "$1"),             // ",." → "."
             ("([.!?])[,;:]", "$1"),             // ".," → "."
-            ("^[,;:.]\\s*", ""),                // leading orphan mark (after removing "Um,")
-            ("\\s{2,}", " "),
+            ("(?m)^[,;:.][ \\t]*", ""),         // leading orphan mark (after removing "Um,")
+            ("[ \\t]{2,}", " "),
+            ("[ \\t]+\n", "\n"),                // no trailing space before a break
+            ("\n{3,}", "\n\n"),
         ]
         for (pattern, template) in rules {
             guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { continue }
@@ -210,7 +248,9 @@ enum TranscriptFastPath {
         var sawEnder = false
         for ch in input {
             if ch.isWhitespace {
-                if sawEnder { pendingCapital = true }
+                // A line break always starts something new, whether or not the
+                // previous line ended in a full stop (list items rarely do).
+                if sawEnder || ch.isNewline { pendingCapital = true }
                 result.append(ch)
                 continue
             }

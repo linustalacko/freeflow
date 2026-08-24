@@ -15,11 +15,15 @@ TEST_RUNNER = $(BUILD_DIR)/FreeFlowTests
 TEST_PRODUCTION_SOURCES = \
 	Sources/AppContextService.swift \
 	Sources/AppName.swift \
+	Sources/DictationProfile.swift \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
 	Sources/ModelConfiguration.swift \
+	Sources/SpokenFormatting.swift \
+	Sources/TranscriptFastPath.swift \
 	Sources/TranscriptTextCore.swift \
 	Sources/UpdateManager.swift \
+	Sources/VocabularyLearner.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \
 	Sources/ShortcutCore/ShortcutMatcher.swift \
 	Sources/ShortcutCore/ShortcutModels.swift

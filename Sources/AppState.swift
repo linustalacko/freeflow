@@ -1208,10 +1208,61 @@ final class AppState: ObservableObject, @unchecked Sendable {
         do {
             try pipelineHistoryStore.update(updated)
             pipelineHistory = pipelineHistoryStore.loadAllHistory()
+            learnVocabularyFromCorrections()
         } catch {
             errorMessage = "Unable to save correction: \(error.localizedDescription)"
         }
     }
+
+    /// Promotes words you keep fixing by hand into custom vocabulary.
+    ///
+    /// Every correction — typed inline in the app you dictated into, or entered
+    /// in the Run Log — is already stored next to the text it replaced. A word
+    /// that gets the same fix twice is a word the recognizer reliably mishears,
+    /// so adding it to the vocabulary fixes it at the source: the STT prompt
+    /// biases toward the spelling, and the cleanup model treats it as canonical.
+    ///
+    /// Turn off with `defaults write … vocabulary_auto_learn_enabled -bool false`.
+    private func learnVocabularyFromCorrections() {
+        let defaults = UserDefaults.standard
+        if let enabled = defaults.object(forKey: Self.vocabularyAutoLearnDefaultsKey) as? Bool, !enabled {
+            return
+        }
+
+        let pairs: [(original: String, corrected: String)] = pipelineHistory.compactMap { item in
+            guard let corrected = item.correctedTranscript?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !corrected.isEmpty else { return nil }
+            let original = item.postProcessedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !original.isEmpty, original != corrected else { return nil }
+            return (original: original, corrected: corrected)
+        }
+        guard !pairs.isEmpty else { return }
+
+        let candidates = VocabularyLearner.candidates(from: pairs, existingVocabulary: customVocabulary)
+        guard !candidates.isEmpty else { return }
+
+        var vocabulary = customVocabulary.trimmingCharacters(in: .whitespacesAndNewlines)
+        for candidate in candidates {
+            if vocabulary.isEmpty {
+                vocabulary = candidate.term
+            } else {
+                if !vocabulary.hasSuffix(",") { vocabulary += "," }
+                vocabulary += "\n\(candidate.term)"
+            }
+            os_log(.info, log: recordingLog,
+                   "Learned vocabulary term %{public}@ from %d corrections",
+                   candidate.term, candidate.occurrences)
+        }
+        customVocabulary = vocabulary
+
+        let names = candidates.map(\.term).joined(separator: ", ")
+        statusText = candidates.count == 1
+            ? "Learned \u{201C}\(names)\u{201D} from your corrections"
+            : "Learned \(candidates.count) words from your corrections"
+        Task { @MainActor in VocabularyNotificationManager.shared.flashCheckmark() }
+    }
+
+    static let vocabularyAutoLearnDefaultsKey = "vocabulary_auto_learn_enabled"
 
     /// Invoked by the passive inline-edit watcher when it detects you edited a
     /// dictation in place. Saves it as a gold label — unless you already
@@ -2715,12 +2766,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // Tune/disable with `defaults write … clean_transcript_fast_path_max_words N`.
         let fastPathOverride = UserDefaults.standard.object(forKey: TranscriptFastPath.maxWordsDefaultsKey) as? Int
         let fastPathMaxWords = fastPathOverride ?? TranscriptFastPath.defaultMaxWords
+        let profile = DictationProfileResolver.profile(
+            bundleIdentifier: context.bundleIdentifier,
+            appName: context.appName,
+            windowTitle: context.windowTitle
+        )
         if customSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            let alreadyClean = TranscriptFastPath.cleanedIfAlreadyClean(
                trimmedRawTranscript, maxWords: fastPathMaxWords, vocabulary: customVocabulary,
-               emailTarget: TranscriptFastPath.looksLikeEmailTarget(
-                   bundleIdentifier: context.bundleIdentifier, appName: context.appName)
+               profile: profile
            ) {
             os_log(.info, log: recordingLog, "Already-clean fast path (%d words), skipping post-processing", words.count)
             return (alreadyClean, .alreadyCleanPastedRaw, "")
@@ -2732,7 +2787,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 context: context,
                 customVocabulary: customVocabulary,
                 customSystemPrompt: customSystemPrompt,
-                outputLanguage: outputLanguage
+                outputLanguage: outputLanguage,
+                styleHint: profile.styleHint
             )
             return (result.transcript, .postProcessingSucceeded, result.prompt)
         } catch {

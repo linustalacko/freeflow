@@ -165,7 +165,8 @@ Behavior:
         context: AppContext,
         customVocabulary: String,
         customSystemPrompt: String = "",
-        outputLanguage: String = ""
+        outputLanguage: String = "",
+        styleHint: String = ""
     ) async throws -> PostProcessingResult {
         let vocabularyTerms = mergedVocabularyTerms(rawVocabulary: customVocabulary)
 
@@ -182,6 +183,7 @@ Behavior:
                     customVocabulary: vocabularyTerms,
                     customSystemPrompt: customSystemPrompt,
                     outputLanguage: outputLanguage,
+                    styleHint: styleHint,
                     deadline: deadline
                 )
             }
@@ -315,6 +317,7 @@ Behavior:
         customVocabulary: [String],
         customSystemPrompt: String = "",
         outputLanguage: String = "",
+        styleHint: String = "",
         deadline: Date
     ) async throws -> PostProcessingResult {
         var primaryModel = resolvedPrimaryModel()
@@ -336,6 +339,7 @@ Behavior:
                 customVocabulary: customVocabulary,
                 customSystemPrompt: customSystemPrompt,
                 outputLanguage: outputLanguage,
+                styleHint: styleHint,
                 deadline: deadline
             )
         } catch let error as PostProcessingError {
@@ -384,6 +388,7 @@ Behavior:
                     customVocabulary: customVocabulary,
                     customSystemPrompt: customSystemPrompt,
                     outputLanguage: outputLanguage,
+                    styleHint: styleHint,
                     deadline: deadline
                 )
             } catch PostProcessingError.suspectedInstructionExecution {
@@ -530,6 +535,7 @@ Behavior:
         customVocabulary: [String],
         customSystemPrompt: String = "",
         outputLanguage: String = "",
+        styleHint: String = "",
         deadline: Date
     ) async throws -> PostProcessingResult {
         var request = try makeChatRequest(deadline: deadline)
@@ -554,6 +560,13 @@ Use these spellings exactly in the output when relevant:
         }
         if !vocabularyPrompt.isEmpty {
             systemPrompt += "\n\n" + vocabularyPrompt
+        }
+        // Where the text is about to land, derived from the frontmost app. Only
+        // appended to the default prompt: a user who wrote their own prompt gets
+        // exactly the prompt they wrote.
+        let trimmedStyleHint = styleHint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedStyleHint.isEmpty, customSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            systemPrompt += "\n\nDestination:\n- " + trimmedStyleHint
         }
 
         let userMessage = """
