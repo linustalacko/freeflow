@@ -67,6 +67,38 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             : AppContextService.defaultScreenshotMaxDimension
     }
 
+    /// Whether a screen capture plus vision round trip is worth running for this
+    /// destination. Only targets whose *wording* depends on what is on screen —
+    /// recipient names in a mail thread, the topic of a document — benefit.
+    ///
+    /// Override with `defaults write … context_enrichment_all_apps -bool true`
+    /// to restore the previous behavior of enriching every dictation.
+    static func wantsContextEnrichment(for target: DictationTarget) -> Bool {
+        if UserDefaults.standard.bool(forKey: "context_enrichment_all_apps") { return true }
+        switch target {
+        case .terminal, .code, .searchField:
+            return false
+        case .email, .chat, .document, .unknown:
+            return true
+        }
+    }
+
+    /// Stand-in summary for targets we deliberately don't enrich, so the cleanup
+    /// prompt still knows where the text is going.
+    static func verbatimTargetActivity(target: DictationTarget, appName: String?) -> String {
+        let app = appName ?? "the active application"
+        switch target {
+        case .terminal:
+            return "You are dictating a shell command in \(app). Treat the text as a command, not prose."
+        case .code:
+            return "You are dictating into the code editor \(app). Preserve identifiers and casing exactly."
+        case .searchField:
+            return "You are dictating a search query in \(app). Return the query only."
+        default:
+            return "You are dictating in \(app)."
+        }
+    }
+
     private func resolveContextPrompt() -> String {
         let trimmedPrompt = customContextPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmedPrompt.isEmpty ? Self.defaultContextPrompt : trimmedPrompt
@@ -115,14 +147,33 @@ Return only two sentences, no labels, no markdown, no extra commentary.
 
         let windowTitle = focusedWindowTitle(from: appElement) ?? appName
         let selectedText = selectedText(from: appElement)
-        let screenshot = captureActiveWindowScreenshot(
-            processIdentifier: frontmostApp.processIdentifier,
-            appElement: appElement,
-            focusedWindowTitle: windowTitle
+
+        // What the activity summary is actually for is spelling and tone: whose
+        // name is in this thread, how formal is this document. A terminal, an
+        // editor, or a launcher gets nothing from that — the words there are
+        // commands and identifiers — so skip the screen capture and the vision
+        // round trip entirely rather than paying them on every dictation.
+        let target = DictationProfileResolver.target(
+            bundleIdentifier: bundleIdentifier,
+            appName: appName,
+            windowTitle: windowTitle
         )
+        let wantsEnrichment = Self.wantsContextEnrichment(for: target)
+
+        let screenshot: (dataURL: String?, mimeType: String?, error: String?) = wantsEnrichment
+            ? captureActiveWindowScreenshot(
+                processIdentifier: frontmostApp.processIdentifier,
+                appElement: appElement,
+                focusedWindowTitle: windowTitle
+              )
+            : (nil, nil, "Skipped: \(target.rawValue) target needs no screen context")
+
         let currentActivity: String
         let contextPrompt: String?
-        if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !wantsEnrichment {
+            currentActivity = Self.verbatimTargetActivity(target: target, appName: appName)
+            contextPrompt = nil
+        } else if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             if let result = await inferActivityWithLLM(
                 appName: appName,
                 bundleIdentifier: bundleIdentifier,

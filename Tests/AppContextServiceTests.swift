@@ -7,6 +7,31 @@ enum AppContextServiceTests {
         testNonStrippingModelPreservesExistingBehavior()
         testDeprecatedGroqModelsAreNotPredefined()
         testQwenCleanupDisablesReasoning()
+        testContextEnrichmentIsSkippedForVerbatimTargets()
+    }
+
+    /// The screen capture plus vision round trip runs on every dictation, so it
+    /// must not run where it cannot help.
+    private static func testContextEnrichmentIsSkippedForVerbatimTargets() {
+        for target in [DictationTarget.terminal, .code, .searchField] {
+            TestSupport.expect(
+                !AppContextService.wantsContextEnrichment(for: target),
+                "\(target.rawValue) should skip the screenshot and vision call"
+            )
+        }
+        // Where on-screen names and topic actually affect the wording, keep it.
+        for target in [DictationTarget.email, .chat, .document, .unknown] {
+            TestSupport.expect(
+                AppContextService.wantsContextEnrichment(for: target),
+                "\(target.rawValue) should still be enriched"
+            )
+        }
+        // Skipped targets still tell the cleanup prompt where the text is going.
+        TestSupport.expect(
+            AppContextService.verbatimTargetActivity(target: .terminal, appName: "Ghostty")
+                .contains("shell command"),
+            "a skipped terminal target should still describe itself"
+        )
     }
 
     private static func testQwenRawOutputIsSummarized() {
