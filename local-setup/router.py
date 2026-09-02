@@ -38,6 +38,15 @@ Config (env; see launchd/com.freeflow.router.plist):
   LOCAL_KEEPALIVE_S       how long the local server keeps the model resident
                           after a request (used to decide whether to /warm). 300
   FORCE_LOCAL=1           local first, Groq chain as safety net.
+  PRECACHE_LLM=1          also let the LOCAL model pre-clean chunks the deterministic
+                          cleaner declines (default 0: such a dictation is cleaned
+                          whole, by the normal chain, at commit — the small base
+                          model is not the one you want judging a self-correction)
+  LOCAL_HEARTBEAT_S       touch the local model this often while idle so macOS
+                          never pages its weights out (60; 0 = off)
+  GROQ_IMAGE_TOKENS       what Groq charges per image against TPM (1800, measured)
+  CONTEXT_MAX_COMPLETION_TOKENS
+                          cap on the completion budget of image (context) requests (256)
   HOSTED_TIMEOUT          per-attempt timeout for Groq (s). default 8
   LOCAL_TIMEOUT           per-attempt timeout for local (s). default 120
   DEFAULT_DEADLINE_MS     used when the client sends no deadline header. 18000
@@ -52,10 +61,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     # deterministic cleanup twin of TranscriptFastPath/SpokenFormatting/DictationProfile
-    from detclean import det_clean, profile_from_system_prompt
+    from detclean import det_clean, finalize_text, profile_from_system_prompt
 except Exception:  # pragma: no cover
-    def det_clean(raw, max_words=60, vocabulary="", profile=None):
+    def det_clean(raw, max_words=60, vocabulary="", profile=None, fragment=False):
         return None
+
+    def finalize_text(text, profile=None):
+        return text
 
     def profile_from_system_prompt(system_prompt):
         return None
@@ -88,6 +100,9 @@ LISTEN_PORT = int(os.environ.get("ROUTER_PORT", "8787"))
 FORCE_LOCAL = os.environ.get("FORCE_LOCAL", "").strip().lower() not in ("", "0", "false", "no")
 HOSTED_TIMEOUT = float(os.environ.get("HOSTED_TIMEOUT", "8"))
 LOCAL_TIMEOUT = float(os.environ.get("LOCAL_TIMEOUT", "120"))
+LOCAL_HEARTBEAT_S = float(os.environ.get("LOCAL_HEARTBEAT_S", "60"))
+GROQ_IMAGE_TOKENS = int(os.environ.get("GROQ_IMAGE_TOKENS", "1800"))
+CONTEXT_MAX_COMPLETION_TOKENS = int(os.environ.get("CONTEXT_MAX_COMPLETION_TOKENS", "256"))
 DEFAULT_DEADLINE_MS = float(os.environ.get("DEFAULT_DEADLINE_MS", "18000"))
 DEADLINE_HEADER = "X-FreeFlow-Deadline-Ms"
 # Groq's WAF 403s the default python-urllib User-Agent, so we send a normal one.
@@ -101,6 +116,19 @@ MIN_ATTEMPT_S = 0.5
 
 def log(msg):
     print("%s %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+def source_sha():
+    """Short hash of this file, reported by /v1/status and the startup line so a
+    deployed copy that drifted from the repo is visible (local-setup/deploy.sh)."""
+    import hashlib
+    try:
+        return hashlib.sha256(open(os.path.abspath(__file__), "rb").read()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
+SOURCE_SHA = source_sha()
 
 
 # ------------------------------------------------------------------- rate limit tracker
@@ -286,11 +314,30 @@ def _groq_post(body_bytes, headers, timeout):
                     raise
 
 
+def _content_parts(content):
+    if isinstance(content, list):
+        return [p for p in content if isinstance(p, dict)]
+    return [{"type": "text", "text": content if isinstance(content, str) else json.dumps(content)}]
+
+
+def _has_image(body):
+    return any(p.get("type") == "image_url"
+               for m in (body.get("messages") or []) for p in _content_parts(m.get("content")))
+
+
 def _estimate_cost_tokens(body):
-    """What Groq will count against TPM for this request: prompt (~4 chars/token)
-    plus the reserved completion budget."""
-    text = json.dumps(body.get("messages", []))
-    prompt = len(text) / 4.0
+    """What Groq will count against TPM for this request: text at ~4 chars/token,
+    each image at a flat GROQ_IMAGE_TOKENS, plus the reserved completion budget.
+    (Counting a screenshot's base64 as text predicted ~25k tokens per context
+    call, so every one of them was "predicted 429" and never even tried hosted —
+    measured: a 1024×640 JPEG costs 1.8k on qwen.)"""
+    prompt = 0.0
+    for m in body.get("messages") or []:
+        for p in _content_parts(m.get("content")):
+            if p.get("type") == "image_url":
+                prompt += GROQ_IMAGE_TOKENS
+            else:
+                prompt += len(json.dumps(p.get("text", ""))) / 4.0
     reserved = body.get("max_completion_tokens") or body.get("max_tokens") or 0
     return int(prompt + reserved)
 
@@ -338,14 +385,16 @@ def call_groq(model, body, timeout):
 
 # ------------------------------------------------------------------ local transport
 _local_warm_until = 0.0
+_local_last_call = 0.0
 _local_lock = threading.Lock()
 _local_is_ollama = None  # unknown until the first native keep-alive touch answers
 
 
 def _mark_local_warm():
-    global _local_warm_until
+    global _local_warm_until, _local_last_call
     with _local_lock:
         _local_warm_until = time.monotonic() + LOCAL_KEEPALIVE_S
+        _local_last_call = time.monotonic()
 
 
 def local_is_warm():
@@ -355,10 +404,28 @@ def local_is_warm():
 
 # The app's cleanup user turn (PostProcessingService.process). Captures CONTEXT
 # and RAW_TRANSCRIPTION so we can re-render them for a model trained on the
-# local-setup training format.
-_APP_USER_RE = re.compile(
-    r'^Instructions: Clean up RAW_TRANSCRIPTION.*?\n\nCONTEXT: "(?P<ctx>.*?)"\n\n'
-    r'RAW_TRANSCRIPTION: "(?P<raw>.*)"\s*$', re.S)
+# local-setup training format, and so we can reuse pre-cleaned chunks. Two
+# formats have shipped: the heredoc one (upstream since 2026-06) and the older
+# quoted one. Getting this wrong is silent — the request is simply "not a
+# cleanup" and skips the local/precache path — so local-setup/app_prompt.py pins
+# the current shape against the Swift source in test_router.py.
+_APP_USER_RES = [
+    re.compile(r'^Instructions: Clean up RAW_TRANSCRIPTION.*?\n\nCONTEXT: "(?P<ctx>.*?)"\n\n'
+               r'RAW_TRANSCRIPTION:\n<<<RAW_TRANSCRIPTION\n(?P<raw>.*)\nRAW_TRANSCRIPTION\s*$', re.S),
+    re.compile(r'^Instructions: Clean up RAW_TRANSCRIPTION.*?\n\nCONTEXT: "(?P<ctx>.*?)"\n\n'
+               r'RAW_TRANSCRIPTION: "(?P<raw>.*)"\s*$', re.S),
+]
+
+
+def parse_cleanup_user(content):
+    """(context, raw_transcript) if `content` is the app's cleanup user turn, else None."""
+    if not isinstance(content, str):
+        return None
+    for rx in _APP_USER_RES:
+        m = rx.match(content)
+        if m:
+            return m.group("ctx").strip(), m.group("raw")
+    return None
 
 
 def to_train_format(messages):
@@ -374,13 +441,13 @@ def to_train_format(messages):
     if not messages:
         return messages
     last = messages[-1]
-    if last.get("role") != "user" or not isinstance(last.get("content"), str):
+    if last.get("role") != "user":
         return messages
-    m = _APP_USER_RE.match(last["content"])
-    if not m:
+    parsed = parse_cleanup_user(last.get("content"))
+    if not parsed:
         return messages
-    parts = ["Raw transcript:\n" + m.group("raw").strip()]
-    ctx = m.group("ctx").strip()
+    ctx, raw = parsed
+    parts = ["Raw transcript:\n" + raw.strip()]
     if ctx:
         parts.append("Context: context: " + ctx)
     parts.append("Clean this up into the final text.")
@@ -437,6 +504,12 @@ def _touch_ollama_keepalive():
 
 
 def call_local(body, timeout):
+    if _has_image(body):
+        # Text-only local servers 404 on image parts — but only once the
+        # single-threaded server gets to the request, which held the app's
+        # context call for up to 10s behind a warm-up. Fail in microseconds so
+        # the app's text-only retry happens now.
+        raise BackendError("local", 0, "no vision on the local model")
     payload = _local_body_for(body)
     req = urllib.request.Request(LOCAL_URL, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
@@ -465,6 +538,12 @@ PRECACHE_ENABLED = os.environ.get("PRECACHE", "1").strip().lower() not in ("0", 
 # when they need no interpretation (see detclean.py) — ~0ms and no risk of a small
 # model "summarizing" a clause it sees without context. The LLM handles the rest.
 DET_CLEAN = os.environ.get("DET_CLEAN", "1").strip().lower() not in ("0", "false", "no")
+# Let the local model pre-clean chunks the deterministic cleaner declines. Off by
+# default: a chunk that needs judgement (a self-correction, a dictated quote) is
+# exactly where a small base model is weakest, and cleaning it in isolation
+# loses the rest of the dictation as context. Such a dictation is simply cleaned
+# whole at commit by the normal chain instead.
+PRECACHE_LLM = os.environ.get("PRECACHE_LLM", "0").strip().lower() not in ("0", "false", "no")
 
 
 _DEFAULT_PROMPT_HEAD = "You are a literal dictation cleanup layer"
@@ -479,19 +558,26 @@ def _vocab_from_system_prompt(system_prompt):
     return system_prompt.split(_VOCAB_MARKER, 1)[1].strip()
 
 
-def clean_chunk(text, system_prompt, context="", timeout=60):
-    """Deterministic when safe, else the local model. Returns (cleaned, how).
+def clean_chunk(text, system_prompt, context="", timeout=60, fragment=False, allow_llm=True):
+    """Deterministic when safe, else the local model. Returns (cleaned, how), or
+    (None, "needs-model") when the chunk needs judgement and `allow_llm` is off.
     Deterministic only under the app's default system prompt — a custom prompt
-    means the user wants the model's judgement, so we give it to them."""
+    means the user wants the model's judgement, so we give it to them.
+    `fragment`: the text is one piece of a longer dictation, so sentence-casing
+    and the closing full stop are left to finalize_text() on the assembled whole
+    (a mid-sentence chunk must not come back as "…should be. An action.")."""
     if DET_CLEAN and (system_prompt or "").lstrip().startswith(_DEFAULT_PROMPT_HEAD):
         d = det_clean(text, vocabulary=_vocab_from_system_prompt(system_prompt),
-                      profile=profile_from_system_prompt(system_prompt))
+                      profile=profile_from_system_prompt(system_prompt), fragment=fragment)
         if d is not None:
             return d, "det"
+    if not allow_llm:
+        return None, "needs-model"
     out = sanitize_cleanup_output(_local_generate(_cleanup_messages_for(text, system_prompt, context),
                                                   _sized_budget(text), timeout=timeout))
     return ("" if out.strip().upper() == "EMPTY" else out), "llm"
-PRECACHE_TTL_S = float(os.environ.get("PRECACHE_TTL_S", "300"))
+PRECACHE_TTL_S = float(os.environ.get("PRECACHE_TTL_S", "1800"))
+PRECACHE_MAX_ENTRIES = int(os.environ.get("PRECACHE_MAX_ENTRIES", "400"))
 _precache_lock = threading.Lock()
 _precache = []  # list of dicts: {raw, done(Event), cleaned, ts}
 
@@ -555,31 +641,35 @@ def precache_segment(raw):
     if not PRECACHE_ENABLED or not raw or not _last_cleanup_system:
         return False
     # Incremental: consume anything already cached at the front of this text.
-    prefix_clean, rest = _consume_precache(raw, time.monotonic() + 3.0, keep=True)
+    prefix_clean, rest, _ = _consume_precache(raw, time.monotonic() + 3.0, keep=True)
     if not rest:
         return True  # everything already cached
     entry = {"raw": rest, "words": _norm_words(rest), "done": threading.Event(), "cleaned": None,
-             "ts": time.monotonic()}
-    if len(entry["words"]) < 2:
+             "how": None, "ts": time.monotonic()}
+    if len(entry["words"]) < 1:
         return False
     with _precache_lock:
         _precache.append(entry)
         cutoff = time.monotonic() - PRECACHE_TTL_S
-        _precache[:] = [e for e in _precache if e["ts"] >= cutoff][-24:]
+        _precache[:] = [e for e in _precache if e["ts"] >= cutoff][-PRECACHE_MAX_ENTRIES:]
 
     def work():
         t0 = time.monotonic()
         try:
-            out, how = clean_chunk(rest, _last_cleanup_system)
+            out, how = clean_chunk(rest, _last_cleanup_system, fragment=True, allow_llm=PRECACHE_LLM)
+            if out is None:
+                log("precache: chunk needs the model (%d chars) — the dictation is cleaned whole at commit" % len(rest))
+                return
             # A chunk is cleaned without the rest of the dictation as context, and a
             # small model occasionally "summarizes" it. Legit cleanup only removes
             # fillers/restarts, so a big word loss means the chunk is unusable —
             # leave the entry failed and the real request cleans everything.
             raw_n, out_n = len(_norm_words(rest)), len(_norm_words(out))
-            if raw_n >= 4 and out_n < 0.6 * raw_n:
+            if how == "llm" and raw_n >= 4 and out_n < 0.6 * raw_n:
                 log("precache: chunk rejected (kept %d/%d words) — will clean at commit" % (out_n, raw_n))
                 return
             entry["cleaned"] = out
+            entry["how"] = how
             log("precache(%s): %d chars → %d chars in %dms" % (how, len(rest), len(out), (time.monotonic() - t0) * 1000))
         except Exception as e:
             log("precache failed: %r" % (e,))
@@ -590,11 +680,12 @@ def precache_segment(raw):
 
 
 def _consume_precache(raw, deadline_at, keep=False):
-    """Return (cleaned_prefix, remainder_raw). Greedily matches cached chunks at
-    the front of `raw`, word by word (punctuation/case-insensitive — the final
-    transcript may differ from a partial by a comma or two). `keep` leaves the
-    entries in the cache (used when a later partial re-covers the same words)."""
-    cleaned_parts, rest = [], raw.strip()
+    """Return (cleaned_prefix, remainder_raw, hows). Greedily matches cached
+    chunks at the front of `raw`, word by word (punctuation/case-insensitive — the
+    final transcript may differ from a partial by a comma or two). `keep` leaves
+    the entries in the cache (a later partial re-covering the same words, or a
+    deterministic dry run). `hows` lists how each matched chunk was cleaned."""
+    cleaned_parts, hows, rest = [], [], raw.strip()
     while rest:
         rest_words = _norm_words(rest)
         with _precache_lock:
@@ -609,12 +700,13 @@ def _consume_precache(raw, deadline_at, keep=False):
             break  # not ready / failed → clean the rest normally
         if best["cleaned"]:
             cleaned_parts.append(best["cleaned"])
+        hows.append(best.get("how") or "llm")
         rest = rest[_cut_after_words(rest, len(best["words"])):].lstrip(" ,;:.!?").strip()
         if not keep:
             with _precache_lock:
                 if best in _precache:
                     _precache.remove(best)
-    return " ".join(cleaned_parts), rest
+    return " ".join(cleaned_parts), rest, hows
 
 
 _ECHO_LINES = ("clean this up into the final text.", "clean this up into the final text",
@@ -654,26 +746,74 @@ def _sanitized_local_response(data):
         return data
 
 
+def _system_of(body):
+    return next((x.get("content") for x in body.get("messages", []) if x.get("role") == "system"), "") or ""
+
+
+def _assemble(prefix_clean, tail_clean, sys_msg):
+    """Join pre-cleaned chunks and the tail, then sentence-case / close the whole
+    (chunks were cleaned as fragments). Only the deterministic pipeline shapes
+    text; with DET_CLEAN off the model's output is passed through untouched."""
+    text = " ".join(p for p in (prefix_clean, tail_clean) if p).strip()
+    if DET_CLEAN and text:
+        text = finalize_text(text, profile_from_system_prompt(sys_msg))
+    return text or "EMPTY"
+
+
+def _completion_payload(content, route="precache"):
+    return json.dumps({"id": route, "object": "chat.completion", "model": LOCAL_MODEL,
+                       "choices": [{"index": 0, "finish_reason": "stop",
+                                    "message": {"role": "assistant", "content": content}}]}).encode()
+
+
+def try_deterministic_precache(body, deadline_at):
+    """Answer a cleanup from deterministically pre-cleaned chunks plus a
+    deterministic tail — no model, no network, ~1ms. Returns the response bytes,
+    or None when any part needs judgement (the cache is left intact so the
+    local backend can still reuse the prefix if the chain ends up there)."""
+    if not (PRECACHE_ENABLED and DET_CLEAN):
+        return None
+    parsed = parse_cleanup_user(body["messages"][-1].get("content"))
+    if not parsed:
+        return None
+    ctx, raw = parsed
+    sys_msg = _system_of(body)
+    if not sys_msg.lstrip().startswith(_DEFAULT_PROMPT_HEAD):
+        return None
+    t0 = time.monotonic()
+    prefix_clean, rest, hows = _consume_precache(raw, deadline_at, keep=True)
+    if not hows or any(h != "det" for h in hows):
+        return None
+    tail_clean = ""
+    if rest:
+        tail_clean, _how = clean_chunk(rest, sys_msg, ctx, fragment=True, allow_llm=False)
+        if tail_clean is None:
+            return None
+    _consume_precache(raw, deadline_at)  # commit: drop the entries we just used
+    content = _assemble(prefix_clean, tail_clean, sys_msg)
+    log("precache(det): %d chars reused, %d-char tail cleaned deterministically in %dms — no model" % (
+        len(raw) - len(rest), len(rest), (time.monotonic() - t0) * 1000))
+    return _completion_payload(content)
+
+
 def call_local_cleanup_with_precache(body, timeout, deadline_at):
     """Local cleanup that reuses pre-cleaned segments. Falls back to call_local."""
-    m = _APP_USER_RE.match(body["messages"][-1]["content"])
-    if not (PRECACHE_ENABLED and m and LOCAL_PROMPT_FORMAT == "train"):
+    parsed = parse_cleanup_user(body["messages"][-1].get("content"))
+    if not (PRECACHE_ENABLED and parsed and LOCAL_PROMPT_FORMAT == "train"):
         return call_local(body, timeout)
-    raw, ctx = m.group("raw"), m.group("ctx").strip()
-    prefix_clean, rest = _consume_precache(raw, deadline_at)
+    ctx, raw = parsed
+    prefix_clean, rest, _hows = _consume_precache(raw, deadline_at)
     if not prefix_clean and rest == raw.strip():
         return call_local(body, timeout)  # nothing cached; normal path (keeps its own params)
-    sys_msg = next((x.get("content") for x in body.get("messages", []) if x.get("role") == "system"), "") or ""
+    sys_msg = _system_of(body)
     t0 = time.monotonic()
     tail_clean, how = "", "-"
     if rest:
-        tail_clean, how = clean_chunk(rest, sys_msg, ctx, timeout=timeout)
-    content = " ".join(p for p in (prefix_clean, tail_clean) if p).strip() or "EMPTY"
+        tail_clean, how = clean_chunk(rest, sys_msg, ctx, timeout=timeout, fragment=True)
+    content = _assemble(prefix_clean, tail_clean, sys_msg)
     log("precache hit: prefix %d chars reused, tail %d chars cleaned (%s) in %dms" % (
         len(raw) - len(rest), len(rest), how, (time.monotonic() - t0) * 1000))
-    return json.dumps({"id": "precache", "object": "chat.completion", "model": LOCAL_MODEL,
-                       "choices": [{"index": 0, "finish_reason": "stop",
-                                    "message": {"role": "assistant", "content": content}}]}).encode()
+    return _completion_payload(content)
 
 
 # The system prompt of the most recent cleanup request. Used to warm the local
@@ -703,7 +843,7 @@ def _remember_cleanup_system(sys_msg):
         pass
 
 
-def warm_local(force=False):
+def warm_local(force=False, quiet=False):
     """Preload the local model / spin the GPU up. `force` = also when the model is
     already resident (Apple GPUs downclock when idle; the first inference after a
     quiet minute is 2-3× slower, so we poke it while the user is still speaking)."""
@@ -716,9 +856,29 @@ def warm_local(force=False):
     t0 = time.monotonic()
     try:
         call_local(tiny, timeout=60)
-        log("warm: local model %s ready in %.0fms" % (LOCAL_MODEL, (time.monotonic() - t0) * 1000))
+        if not quiet:
+            log("warm: local model %s ready in %.0fms" % (LOCAL_MODEL, (time.monotonic() - t0) * 1000))
     except Exception as e:
         log("warm: local preload failed: %r" % (e,))
+
+
+def heartbeat_tick():
+    """Keep the local model's weights resident: if nothing has touched it for
+    LOCAL_HEARTBEAT_S, run a 1-token generation (~20ms). Under memory pressure a
+    model idle for ten minutes cost 7–11s of page-ins on the next request."""
+    if LOCAL_HEARTBEAT_S <= 0 or time.monotonic() - _local_last_call < LOCAL_HEARTBEAT_S * 0.9:
+        return False
+    warm_local(force=True, quiet=True)
+    return True
+
+
+def _heartbeat_loop():
+    while True:
+        time.sleep(max(1.0, LOCAL_HEARTBEAT_S))
+        try:
+            heartbeat_tick()
+        except Exception:
+            pass
 
 
 def hosted_reachable():
@@ -776,9 +936,9 @@ def is_cleanup_request(body):
     """True for FreeFlow's dictation-cleanup prompt (the thing the on-device model
     is fine-tuned for). Context inference / edit mode / anything else → False."""
     msgs = body.get("messages") or []
-    if not msgs or msgs[-1].get("role") != "user" or not isinstance(msgs[-1].get("content"), str):
+    if not msgs or msgs[-1].get("role") != "user":
         return False
-    return _APP_USER_RE.match(msgs[-1]["content"]) is not None
+    return parse_cleanup_user(msgs[-1].get("content")) is not None
 
 
 def backend_chain(primary_model, local_first):
@@ -801,6 +961,13 @@ def route(body, deadline_at):
         sys_msg = next((m.get("content") for m in body.get("messages", []) if m.get("role") == "system"), None)
         if isinstance(sys_msg, str):
             _remember_cleanup_system(sys_msg)
+        # Everything settled while the user spoke was cleaned deterministically and
+        # the tail needs no judgement either → answer now, whatever the chain order.
+        t0 = time.monotonic()
+        data = try_deterministic_precache(body, deadline_at)
+        if data is not None:
+            log("route=precache ms=%d" % ((time.monotonic() - t0) * 1000))
+            return "precache", data
     # FORCE_LOCAL means "the on-device model does the CLEANUP". Other prompts
     # (the context-inference call at hotkey-down, edit mode) go hosted-first: the
     # local model isn't tuned for them, they'd occupy the single-threaded local
@@ -869,6 +1036,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(models_payload()).encode())
         elif p.endswith("/status"):
             self._send(200, json.dumps({
+                "source_sha": SOURCE_SHA, "precache_llm": PRECACHE_LLM, "local_heartbeat_s": LOCAL_HEARTBEAT_S,
                 "force_local": FORCE_LOCAL, "local_model": LOCAL_MODEL, "local_url": LOCAL_URL,
                 "local_warm": local_is_warm(), "fallback_models": GROQ_FALLBACK_MODELS,
                 "hosted_breaker_open": hosted_breaker_open(),
@@ -909,6 +1077,12 @@ class Handler(BaseHTTPRequestHandler):
             deadline_ms = float(self.headers.get(DEADLINE_HEADER, DEFAULT_DEADLINE_MS))
         except ValueError:
             deadline_ms = DEFAULT_DEADLINE_MS
+        if _has_image(body) and not is_cleanup_request(body):
+            # A two-sentence activity summary never needs more; Groq reserves the
+            # whole budget against the per-minute bucket the cleanup fallback uses.
+            for k in ("max_completion_tokens", "max_tokens"):
+                if isinstance(body.get(k), (int, float)) and body[k] > CONTEXT_MAX_COMPLETION_TOKENS:
+                    body[k] = CONTEXT_MAX_COMPLETION_TOKENS
         deadline_at = time.monotonic() + max(0.0, deadline_ms / 1000.0 - DEADLINE_MARGIN_S)
         log("request model=%s deadline_ms=%s max_completion_tokens=%s est_cost=%d" % (
             body.get("model"), self.headers.get(DEADLINE_HEADER, "none(default)"),
@@ -924,8 +1098,11 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     srv = ThreadingHTTPServer(("127.0.0.1", LISTEN_PORT), Handler)
     srv.daemon_threads = True
-    log("freeflow-router listening on 127.0.0.1:%d hosted=%s fallbacks=%s local=%s@%s force_local=%s" % (
-        LISTEN_PORT, "on" if GROQ_KEY else "off", ",".join(GROQ_FALLBACK_MODELS), LOCAL_MODEL, LOCAL_URL, FORCE_LOCAL))
+    log("freeflow-router %s listening on 127.0.0.1:%d hosted=%s fallbacks=%s local=%s@%s force_local=%s precache_llm=%s heartbeat=%.0fs" % (
+        SOURCE_SHA, LISTEN_PORT, "on" if GROQ_KEY else "off", ",".join(GROQ_FALLBACK_MODELS), LOCAL_MODEL, LOCAL_URL,
+        FORCE_LOCAL, PRECACHE_LLM, LOCAL_HEARTBEAT_S))
+    if LOCAL_HEARTBEAT_S > 0:
+        threading.Thread(target=_heartbeat_loop, daemon=True, name="local-heartbeat").start()
     srv.serve_forever()
 
 

@@ -317,7 +317,13 @@ def _vocab_mismatch(text, joined, vocabulary):
     return False
 
 
-def det_clean(raw, max_words=60, vocabulary="", profile=None):
+def det_clean(raw, max_words=60, vocabulary="", profile=None, fragment=False):
+    """Cleaned text, or None when the text needs the model.
+
+    `fragment=True` cleans one piece of a longer dictation (a settled chunk or
+    the tail at commit): the same bail rules and the same mechanical edits, but
+    no sentence-casing and no closing full stop — those belong to the whole
+    text, see finalize_text(). An all-filler fragment cleans to ""."""
     profile = profile or profile_for("unknown")
     text = " ".join(l.strip() for l in (raw or "").splitlines() if l.strip()).strip()
     if not text or max_words <= 0:
@@ -367,8 +373,26 @@ def det_clean(raw, max_words=60, vocabulary="", profile=None):
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if fragment:
+        return text
     if not text:
         return None
+    return finalize_text(text, profile, produced_list)
+
+
+_LIST_LINE_RE = re.compile(r"^(?:[-•*]\s|\d+\.\s)")
+
+
+def finalize_text(text, profile=None, produced_list=None):
+    """The whole-text half of det_clean: sentence-case (unless the target is
+    verbatim) and add the closing full stop where the profile wants one. Used on
+    assembled fragments too, where `produced_list` is inferred from the layout."""
+    profile = profile or profile_for("unknown")
+    text = (text or "").strip()
+    if not text:
+        return text
+    if produced_list is None:
+        produced_list = any(_LIST_LINE_RE.match(l.strip()) for l in text.split("\n"))
 
     if not profile["preserves_verbatim"]:
         chars, pending, saw_ender = [], True, False

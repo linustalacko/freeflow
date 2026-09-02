@@ -4,9 +4,10 @@ This fork adds a **100% local** (or fast hybrid) speech-to-text + cleanup pipeli
 FreeFlow, so you don't need to pay for a hosted transcription API.
 
 ```
-hold Cmd+Ctrl ─▶ Parakeet-TDT (local, MLX)  ──▶  router ──▶ local fine-tuned Qwen (~0.3s)   [FORCE_LOCAL=1]
-                  streams while you talk;                   ├─ local down? Groq gpt-oss-20b, then other buckets
-                  key-up → text in ~0.1s                    └─ (or Groq first / local fallback with FORCE_LOCAL=0)
+hold Cmd+Ctrl ─▶ Parakeet-TDT (local, MLX)  ──▶  router ──▶ pre-cleaned chunks + deterministic tail (~10ms, no model)
+                  words settle while you talk;              ├─ Groq gpt-oss-20b, then the other buckets (hosted-first)
+                  key-up → text in ~0.2s                    └─ local Qwen via mlx_lm — offline / quota fallback
+                                                               (FORCE_LOCAL=1 puts it first, e.g. with a good fine-tune)
 ```
 
 - **Transcription** runs locally with **Parakeet-TDT 0.6B** via `parakeet-mlx`
@@ -60,11 +61,14 @@ ollama pull llama3.1:8b            # local cleanup fallback model
 cp stt_server.py router.py start-ollama.sh ~/.freeflow-stt/
 ```
 
-`stt_server.py` (port 8082) downloads `mlx-community/parakeet-tdt-0.6b-v3` on first
-start (~1.2 GB; `-v2` is English-only and slightly stronger there). It logs one line
-per dictation: `commit: tail 1.2s → final in 96ms`. Tests: `python3 test_stt_server.py`
-(protocol contract) and `python3 test_stt_server.py --real some.wav --pace`
-(streams a real file at real-time speed and prints commit→final latency).
+`stt_server.py` (port 8082) downloads `mlx-community/parakeet-tdt-0.6b-v2` on first
+start (~1.2 GB; `-v3` is multilingual, see the note in the file). While you talk it
+logs `settled: +38 chars (8 words, settled to 9.5s of 12.0s, window 12.0s → 123ms)`
+lines; at key-up one `commit: tail 3.1s (window 13.1s) → final in 201ms` line.
+`curl 127.0.0.1:8082/health` reports its MLX memory. Tests: `python3 test_stt_server.py`
+(protocol contract, settling, splicing, resampling) and
+`python3 test_stt_server.py --real some.wav --pace` (streams a real file at
+real-time speed and prints commit→final latency).
 
 ### Router
 
@@ -129,8 +133,14 @@ memory-bound decode). Serve `--model <base-4bit> --adapter-path <adapters>`.
 the default. Train one with `BASE_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit
 ./finetune_local.sh` and compare with `eval_models.py` if you want to trade.
 
-**Local first for speed.** `FORCE_LOCAL=1` puts the local model first (~0.3–0.45s
-per cleanup, no network) with the Groq chain as the safety net; `0` = Groq first.
+**Hosted first, unless you have a fine-tune you trust.** With `FORCE_LOCAL=0`
+(the default) a dictation that needs the model goes to Groq gpt-oss-20b first
+(~0.3–0.9s, and the better cleaner) and to the local model only offline or out of
+quota; `1` puts the local model first (~0.3–0.45s, no network). Either way the
+router keeps the local model resident with a 1-token touch every
+`LOCAL_HEARTBEAT_S` (60) — otherwise macOS pages it out between dictations and
+the first request after a break pays 7–11s. Most dictations never reach either:
+see *How the pipeline stays fast*.
 
 `LOCAL_PROMPT_FORMAT=train` makes the router re-render FreeFlow's runtime prompt into
 the exact format the model was trained on. Skipping this is a silent accuracy bug:
@@ -179,44 +189,71 @@ curl -s http://127.0.0.1:11435/v1/status
 
 ## How the pipeline stays fast (what to keep in mind when changing things)
 
-Measured with `bench_e2e.py` on real recordings (M-series, 2026-08): key-up → cleaned
-text **median ≈0.15s, max ≈0.26s** (whisper + Groq era: 1.1–1.4s, sometimes 8s+).
+Measured with `bench_e2e.py` on 8 real recordings (4–53s) on 2026-09-02, on a
+machine at load average 20: commit→final **0.18–0.54s** with the key-up tail
+bounded to 3–8s of audio however long the dictation, cleanup **~10ms** when the
+router could assemble it deterministically (3 of 8), otherwise Groq at 0.46–0.65s;
+streamed-vs-batch WER 2.8%, every difference a filler/stutter or "90"/"ninety".
 
-* **Parakeet-TDT v2 via `stt_server.py`** (`:8082`, `com.freeflow.stt`): no 30-s
-  encoder floor like whisper; transcribes finished segments while you speak; the
-  tail at key-up costs ~0.1s. v2 (English) is the default because v3 dropped words /
-  returned "" on 10/46 real tail clips (v2: 0/46). Segments only split on ≥0.8s of
-  true silence after ≥3s speech, cut in the middle of the pause — more eager settings
-  were measured to introduce word errors at the boundaries.
-* **Cleanup on the on-device fine-tuned Qwen 1.5B** (`FORCE_LOCAL=1`, `mlx_lm` server
-  `:8081`): ~7ms/token, hardware-bound — the router therefore works on generating
-  *fewer tokens at key-up*: the STT server POSTs each finalized segment to the router's
-  `/v1/precache`, which cleans it during speech; the app's real request then reuses the
-  cleaned prefix and only the tail is generated (`precache hit:` lines in router.log).
-* **Only cleanup prompts go local-first.** The context-inference call at hotkey-down
-  is hosted (Groq qwen, ~0.2s): on the local model it cost 0.5s of GPU *and* evicted
-  mlx_lm's single-prompt KV cache, adding ~170ms prefill to every cleanup.
+* **Words settle while you talk** (`stt_server.py`, `:8082`, `com.freeflow.stt`).
+  Every 2s of audio the server decodes a *window*: the unsettled audio plus 10s of
+  already-settled audio in front of it. A word the last two windows agree on
+  (compared without case/punctuation) that ended ≥1s before the live edge is
+  settled: emitted to the app as a `completed` event and POSTed to the router's
+  `/v1/precache`. At key-up the same window decode covers just the tail and is
+  spliced after the settled text by *word anchor* (the last three settled words;
+  TDT timestamps are quantised to 80ms, so timestamps alone duplicate or drop a
+  boundary word). The audio is never cut: hard cuts at pauses were measured to
+  change 2.7% of words, mostly casing and spelling at the cut. v2 (English) is the
+  default because v3 dropped words / returned "" on 10/46 real tail clips.
+* **The mic stream is resampled with context.** Each `append` message used to be
+  resampled on its own, which put a filter transient at every message edge — 0.4%
+  of words changed on real recordings, 6% on a short one. `StreamResampler` holds
+  back 10ms of input so every emitted sample had real neighbours on both sides.
+* **Memory is bounded, and the weights stay hot.** MLX keeps every freed buffer
+  in a cache keyed by size; clips of ever-different lengths never reuse one, and
+  the process reached 17 GB in nine days — which swapped the whole machine, and
+  every dictation after a break paid 7–13s of page-ins for *both* models.
+  `STT_CACHE_MB` (512) caps it with no measurable latency cost, `STT_WIRED_MB`
+  wires the weights, and both servers are touched while idle (`STT_HEARTBEAT_S`
+  45, router `LOCAL_HEARTBEAT_S` 60). `curl :8082/health` shows the numbers.
+* **Deterministic cleanup first, LLM only when needed.** Parakeet already punctuates
+  and capitalises, so most of what the model did was mechanical: strip "um/uh",
+  convert a dictated "comma", fix a capital. `TranscriptFastPath.swift` (app, ≤60
+  words) and its twin `detclean.py` (router) do that in ~0ms and *bail to the
+  model* for anything needing interpretation: self-corrections and restarts ("no
+  actually", "is there anything is there any way"), dictated formatting, greetings
+  (email layout), quotes/brackets, repeated sentences, mis-cased vocabulary (never
+  with a custom system prompt or output language). Measured against the LLM's own
+  output on real transcripts: identical words on everything it accepts.
+* **Settled chunks are pre-cleaned as fragments and assembled at commit.** The
+  router cleans each chunk deterministically without sentence-casing or a closing
+  full stop (a mid-sentence chunk must not come back as "…should be. An action."),
+  and at commit `finalize_text` cases and closes the assembled whole. If every
+  chunk and the tail were deterministic the router answers in ~10ms with no model
+  (`route=precache`); if any piece needs judgement the *whole* dictation goes to
+  the normal chain — a small base model must not judge a self-correction in
+  isolation (`PRECACHE_LLM=1` re-enables that for a fine-tune you trust).
+* **The router must recognise the app's request.** It parses the cleanup user
+  turn to know a request *is* a cleanup; upstream changed that turn to a heredoc
+  in 2026-06 and the router silently treated every real dictation as "not a
+  cleanup" for two months while the bench (which used the old shape) kept
+  reporting 150ms. `app_prompt.py` now pins the shape, `test_router.py` checks it
+  against the Swift source, and the bench sends exactly it.
+* **Context (screenshot) calls are priced correctly and never go local.** Groq
+  charges ~1.8k tokens per image; counting the base64 as text predicted ~25k, so
+  every context call was "predicted 429", sent to the text-only local server, and
+  sat behind its warm-up for up to 10s. Images now cost `GROQ_IMAGE_TOKENS`, the
+  local backend refuses them in microseconds (the app's text-only retry follows),
+  and their completion budget is capped (`CONTEXT_MAX_COMPLETION_TOKENS`, 256).
 * **GPU warm-up**: Apple GPUs downclock when idle (first inference 2–3× slower), so
   `/warm` (hotkey-down) pokes the local LLM with a *prefix-compatible* prompt and the
   STT server runs a tiny inference on session open.
-* **Deterministic cleanup first, LLM only when needed.** Parakeet already punctuates
-  and capitalises, so most of what the model did was mechanical: strip "um/uh",
-  convert a dictated "comma", fix a capital. `TranscriptFastPath.swift` (app) and its
-  twin `detclean.py` (router, for pre-cached chunks and the tail at commit) do that in
-  ~0ms and *bail to the model* for anything needing interpretation: self-corrections
-  and restarts ("no actually", "is there anything is there any way"), dictated
-  formatting, greetings (email layout), quotes/brackets, repeated sentences,
-  mis-cased vocabulary, or >60 words (`clean_transcript_fast_path_max_words`; 0 = off;
-  never used with a custom system prompt or output language). Measured against the
-  LLM's own output on real transcripts: identical words on everything it accepts.
-* **Pause-less speech is pre-cleaned too**: every ~2s of speech the STT server
-  transcribes the buffer-so-far and hands the router every complete sentence that
-  ended ≥0.8s ago; the router matches by words (punctuation-insensitive), cleans
-  only the new sentences, and rejects a chunk the model shortened by >40%. The cache
-  is reset at each new dictation so nothing stale can ever match.
 * Things measured and rejected: parakeet-mlx native token streaming (slower than real
   time, less accurate), speculative decoding with a 0.5B draft (slower at ~45 output
-  tokens), 0.5B fine-tune (2× faster, WER 21%), fusing the LoRA into 4-bit (lossy).
+  tokens), 0.5B fine-tune (2× faster, WER 21%), fusing the LoRA into 4-bit (lossy),
+  cutting the audio at pauses or token gaps (2.7% of words changed), a 2s settle
+  horizon (no more accurate than 1s, just later).
 
 ```bash
 ~/.freeflow-ft/venv/bin/python local-setup/bench_e2e.py --files 6 --label after-change

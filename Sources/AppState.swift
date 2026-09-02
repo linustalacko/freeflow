@@ -2613,6 +2613,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
         )
     }
 
+    /// "0.42s (stt 0.11s · context 0.00s · cleanup 0.31s)" — what the user waited
+    /// after key-up, and where. Stored with each run-log entry.
+    static func stageTiming(
+        keyUp: CFAbsoluteTime, transcript: CFAbsoluteTime, context: CFAbsoluteTime, cleaned: CFAbsoluteTime
+    ) -> String {
+        String(
+            format: "%.2fs (stt %.2fs · context %.2fs · cleanup %.2fs)",
+            cleaned - keyUp, transcript - keyUp, context - transcript, cleaned - context
+        )
+    }
+
     private static func statusMessage(
         for outcome: TranscriptProcessingOutcome,
         parsedTranscript: TranscriptCommandParsingResult,
@@ -2825,6 +2836,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func stopAndTranscribe() {
+        // Key-up is the moment the user starts waiting; every stage below is
+        // timed against it so a regression shows up in the run log, not in
+        // someone's patience.
+        let tKeyUp = CFAbsoluteTimeGetCurrent()
         cancelPendingShortcutStart()
         cancelRecordingInitializationTimer()
         shortcutSessionController.reset()
@@ -2915,6 +2930,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         fileURL: transcriptionFileURL
                     )
                     let rawTranscript = try await transcript
+                    let tTranscript = CFAbsoluteTimeGetCurrent()
                     let parsedTranscript = Self.parseTranscriptCommands(
                         from: rawTranscript,
                         pressEnterCommandEnabled: self.isPressEnterVoiceCommandEnabled
@@ -2939,6 +2955,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         appContext = self.fallbackContextAtStop()
                     }
                     try Task.checkCancellation()
+                    let tContext = CFAbsoluteTimeGetCurrent()
                     await MainActor.run { [weak self] in
                         self?.debugStatusMessage = "Running post-processing"
                     }
@@ -2953,6 +2970,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         preserveExactWording: self.preserveExactWording
                     )
                     try Task.checkCancellation()
+                    let tCleaned = CFAbsoluteTimeGetCurrent()
+                    let stageTiming = Self.stageTiming(
+                        keyUp: tKeyUp, transcript: tTranscript, context: tContext, cleaned: tCleaned
+                    )
+                    os_log(.info, log: recordingLog, "key-up → text %{public}@", stageTiming)
 
                     await MainActor.run {
                         guard self.isTranscribing else { return }
@@ -2970,7 +2992,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         let processingStatus = Self.statusMessage(
                             for: result.outcome,
                             parsedTranscript: parsedTranscript
-                        )
+                        ) + " · " + stageTiming
                         self.lastPostProcessingPrompt = result.prompt
                         self.lastRawTranscript = trimmedRawTranscript
                         self.lastPostProcessedTranscript = trimmedFinalTranscript

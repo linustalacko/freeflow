@@ -13,8 +13,10 @@ Run with the venv that has aiohttp (+ parakeet-mlx for --real):
 import asyncio
 import base64
 import concurrent.futures
+import io
 import json
 import os
+import re
 import sys
 import time
 import unittest
@@ -29,62 +31,104 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import stt_server  # noqa: E402
 
-from aiohttp import web, ClientSession, WSMsgType  # noqa: E402
+from aiohttp import web, ClientSession, WSMsgType, FormData  # noqa: E402
+
+SR = 16000
+
+
+class FakeToken:
+    def __init__(self, text, start, end):
+        self.text, self.start, self.end = text, start, end
+
+
+def word_tone(k, seconds=0.4, sr=SR, amp=0.3):
+    """The k-th test word: a tone whose frequency encodes k, so a fake transcriber
+    can name it from the audio alone (any window, any offset)."""
+    t = np.arange(int(seconds * sr)) / sr
+    return (amp * np.sin(2 * np.pi * (200 + 20 * k) * t)).astype(np.float32)
+
+
+def silence(seconds, sr=SR):
+    return np.zeros(int(seconds * sr), dtype=np.float32)
+
+
+def speech(words, gap=0.15, lead=0.0):
+    """`words` consecutive test words separated by `gap` seconds of silence."""
+    parts = [silence(lead)] if lead else []
+    for k in words:
+        parts += [word_tone(k), silence(gap)]
+    return np.concatenate(parts)
+
+
+def tone_burst(seconds, sr=SR, amp=0.3):
+    """Loud 'speech-like' signal (kept for the batch test)."""
+    return speech(list(range(int(seconds / 0.55) + 1)))[: int(seconds * sr)]
 
 
 class FakeTranscriber:
-    """Deterministic stand-in: returns 'seg<N>' for the Nth call and sleeps
-    `delay` so we can create in-flight jobs at commit time."""
+    """Deterministic stand-in for Parakeet: finds tone runs in the audio and
+    names each by its frequency (see word_tone), with real timestamps. `delay`
+    simulates GPU time so tests can create in-flight jobs at commit time."""
 
     def __init__(self, delay=0.0):
         self.delay = delay
-        self.calls = []
+        self.calls = []      # audio lengths of transcribe_tokens calls
+        self.pokes = 0       # all-zero clips (session-open poke / heartbeat)
+
+    def _runs(self, x):
+        frame = int(0.02 * SR)
+        n = len(x) // frame
+        rms = np.array([float(np.sqrt(np.mean(x[i * frame:(i + 1) * frame] ** 2))) for i in range(n)])
+        runs, start = [], None
+        for i, v in enumerate(rms):
+            if v > 0.02 and start is None:
+                start = i
+            elif v <= 0.02 and start is not None:
+                runs.append((start * frame, i * frame))
+                start = None
+        if start is not None:
+            runs.append((start * frame, n * frame))
+        return [r for r in runs if r[1] - r[0] >= int(0.1 * SR)]
+
+    def transcribe_tokens(self, x):
+        if not np.any(x):
+            self.pokes += 1
+            return []
+        self.calls.append(len(x))
+        if self.delay:
+            time.sleep(self.delay)
+        toks = []
+        for a, b in self._runs(x):
+            seg = x[a:b]
+            spectrum = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+            freq = float(np.argmax(spectrum)) * SR / len(seg)
+            k = int(round((freq - 200) / 20.0))
+            toks.append(FakeToken(" w%d" % k, a / SR, b / SR))
+        return toks
 
     def transcribe(self, x):
         if not np.any(x):
-            return ""  # the session-open GPU warm-up (all zeros) — not a real call
-        self.calls.append(len(x))
-        time.sleep(self.delay)
-        if len(x) < int(0.15 * stt_server.TARGET_SR):
+            self.pokes += 1
             return ""
-        return "seg%d" % len(self.calls)
-
-    def settled_sentences(self, x, settle_s):
-        # partial pre-transcription: report a sentence for every 3s of audio,
-        # never counting toward the segment numbering above
-        self.partials = getattr(self, "partials", 0) + 1
-        n = int(len(x) / stt_server.TARGET_SR // 3)
-        return " ".join("Partial sentence %d." % i for i in range(1, n + 1))
+        return stt_server.words_text(stt_server.words_from_tokens(self.transcribe_tokens(x)))
 
 
 def make_app(transcriber):
-    app = web.Application(client_max_size=64 * 1024 * 1024)
-    app["executor"] = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    app["transcriber"] = transcriber
-    app.add_routes([web.get("/v1/realtime", stt_server.handle_realtime),
-                    web.post("/v1/audio/transcriptions", stt_server.handle_transcriptions)])
-    return app
+    return stt_server.make_app(transcriber, concurrent.futures.ThreadPoolExecutor(max_workers=1))
 
 
-def pcm16_b64(x_float, sr_out=24000, sr_in=16000):
+def pcm16_b64(x_float, sr_out=24000, sr_in=SR):
     y = stt_server.resample(x_float.astype(np.float32), sr_in, sr_out)
     return base64.b64encode((np.clip(y, -1, 1) * 32767).astype("<i2").tobytes()).decode()
 
 
-def tone_burst(seconds, sr=16000, amp=0.3):
-    """Loud 'speech-like' signal the energy VAD counts as speech."""
-    t = np.arange(int(seconds * sr)) / sr
-    return (amp * np.sin(2 * np.pi * 220 * t) * (0.85 + 0.15 * np.sin(2 * np.pi * 3 * t))).astype(np.float32)
-
-
-def silence(seconds, sr=16000):
-    return np.zeros(int(seconds * sr), dtype=np.float32)
-
-
-async def run_session(port, chunks_16k, pace=False, chunk_s=0.1):
+async def run_session(port, chunks_16k, pace=False, chunk_s=0.1, speed=1.0):
     """Drive the protocol like RealtimeTranscriptionService.swift. Returns
-    (events, final_transcript_client_view, commit_to_final_s)."""
+    (events, final_transcript_client_view, commit_to_final_s). `pace` sends the
+    audio at real-time speed divided by `speed`. Like the mic, the 24 kHz stream
+    is one continuous signal that is merely *sent* in pieces."""
     events, final_parts, t_commit, t_final = [], [], None, None
+    stream24 = stt_server.resample(np.concatenate(chunks_16k).astype(np.float32), SR, 24000)
     async with ClientSession() as cs:
         async with cs.ws_connect("http://127.0.0.1:%d/v1/realtime?intent=transcription" % port) as ws:
             await ws.send_str(json.dumps({"type": "session.update", "session": {"type": "transcription", "audio": {
@@ -104,14 +148,14 @@ async def run_session(port, chunks_16k, pace=False, chunk_s=0.1):
                             t_final = time.monotonic()
                             return
             rt = asyncio.ensure_future(reader())
-            step = int(chunk_s * 16000)
-            for x in chunks_16k:
-                for i in range(0, len(x), step):
-                    await ws.send_str(json.dumps({"type": "input_audio_buffer.append", "audio": pcm16_b64(x[i:i + step])}))
-                    if pace:
-                        await asyncio.sleep(chunk_s)
-                    else:
-                        await asyncio.sleep(0)
+            step = int(chunk_s * 24000)
+            for i in range(0, len(stream24), step):
+                piece = (np.clip(stream24[i:i + step], -1, 1) * 32767).astype("<i2").tobytes()
+                await ws.send_str(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(piece).decode()}))
+                if pace:
+                    await asyncio.sleep(chunk_s / speed)
+                else:
+                    await asyncio.sleep(0)
             t_commit = time.monotonic()
             await ws.send_str(json.dumps({"type": "input_audio_buffer.commit"}))
             await asyncio.wait_for(rt, timeout=60)
@@ -132,6 +176,8 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         rsite = web.TCPSite(self.router_runner, "127.0.0.1", 0)
         await rsite.start()
         stt_server.PRECACHE_URL = "http://127.0.0.1:%d/v1/precache" % rsite._server.sockets[0].getsockname()[1]
+        self.saved = {k: getattr(stt_server, k) for k in ("HEARTBEAT_S", "LEFT_CONTEXT_S", "MIN_SETTLE_S")}
+        stt_server.HEARTBEAT_S = 0
         self.app = make_app(self.fake)
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
@@ -140,73 +186,88 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         self.port = self.site._server.sockets[0].getsockname()[1]
 
     async def asyncTearDown(self):
-        if self.app.get("http"):
-            await self.app["http"].close()
         await self.runner.cleanup()
         await self.router_runner.cleanup()
         self.app["executor"].shutdown(wait=False)
+        for k, v in self.saved.items():
+            setattr(stt_server, k, v)
 
-    async def test_no_pause_means_single_final_completed_with_everything(self):
-        events, text, _ = await run_session(self.port, [tone_burst(2.0)])
-        completed = [e for e in events if e["type"].endswith("completed")]
-        self.assertEqual(len(completed), 1)
-        self.assertTrue(completed[0]["_after_commit"])
-        self.assertEqual(text, "seg1")
+    @staticmethod
+    def completed(events, after_commit):
+        return [e for e in events if e["type"].endswith("completed") and e["_after_commit"] == after_commit]
+
+    async def test_short_speech_means_single_final_completed_with_everything(self):
+        events, text, _ = await run_session(self.port, [speech([1, 2, 3])])
+        self.assertEqual(len(self.completed(events, False)), 0)
+        self.assertEqual(len(self.completed(events, True)), 1)
+        self.assertEqual(text, "w1 w2 w3")
         self.assertTrue(any(e["type"] == "input_audio_buffer.committed" for e in events))
 
-    async def test_pause_splits_segment_mid_speech_then_tail_at_commit(self):
-        # 3.5s speech, 1.2s pause (> PAUSE_S after > MIN_SEGMENT_S) → segment 1 emitted
-        # mid-speech; then 1.5s more speech → tail at commit.
-        events, text, _ = await run_session(self.port, [tone_burst(3.5), silence(1.2), tone_burst(1.5)])
-        completed = [e for e in events if e["type"].endswith("completed")]
-        self.assertEqual(len(completed), 2, [e["type"] for e in events])
-        self.assertFalse(completed[0]["_after_commit"], "first segment must be emitted before commit")
-        self.assertTrue(completed[1]["_after_commit"])
-        self.assertEqual(text, "seg1 seg2")
+    async def test_continuous_speech_settles_words_mid_speech_and_only_the_tail_at_commit(self):
+        # 16 words ≈ 8.8s of pause-less speech: words the last two windows agree
+        # on (and that ended ≥1s before the window end) are emitted while the
+        # user is still talking; the final event carries only what is left.
+        words = list(range(16))
+        events, text, _ = await run_session(self.port, [speech(words)], pace=True, speed=8)
+        mid = self.completed(events, False)
+        self.assertGreaterEqual(len(mid), 1, [e["type"] for e in events])
+        self.assertEqual(len(self.completed(events, True)), 1)
+        self.assertEqual(text, " ".join("w%d" % k for k in words), "nothing lost, nothing duplicated")
+        final = self.completed(events, True)[0]["transcript"]
+        self.assertLess(len(final.split()), len(words), "the tail must not re-transcribe settled words")
         await asyncio.sleep(0.2)
-        pushed = [p for p in self.precached if p]  # drop the session-open reset
-        self.assertIn("seg1", pushed, "mid-speech segment must be pushed to the router precache")
-        self.assertNotIn("seg2", pushed, "the tail must not be precached")
-        # segment 1 must contain roughly the first burst (3.5s minus the 0.3s guard),
-        # tail the rest — nothing lost, nothing duplicated
-        total = sum(self.fake.calls)
-        self.assertAlmostEqual(total / 16000, 3.5 + 1.2 + 1.5, delta=0.15)
+        pushed = [p for p in self.precached if p]
+        self.assertEqual(pushed, [e["transcript"] for e in mid], "every settled chunk is precached, in order")
+        self.assertNotIn(final, pushed, "the tail must not be precached")
+        # the commit window is bounded: left context + tail, not the whole session
+        self.assertLess(self.fake.calls[-1] / SR, stt_server.LEFT_CONTEXT_S + 5.0)
 
-    async def test_inflight_segment_at_commit_is_merged_into_one_post_commit_event(self):
-        # Slow transcriber: the mid-speech segment job is still running when commit
-        # arrives. Client contract: exactly ONE completed after commit, carrying both.
-        self.fake.delay = 0.6
-        events, text, _ = await run_session(self.port, [tone_burst(3.5), silence(1.2), tone_burst(0.8)])
-        after = [e for e in events if e["type"].endswith("completed") and e["_after_commit"]]
-        before = [e for e in events if e["type"].endswith("completed") and not e["_after_commit"]]
-        self.assertEqual(len(before), 0, "segment finished after commit must not be emitted separately")
+    async def test_partial_finishing_after_commit_is_discarded(self):
+        # Slow transcriber: a mid-speech window is still running when commit
+        # arrives. Client contract: exactly ONE completed after commit, carrying
+        # everything not yet emitted — the late partial must not be emitted.
+        self.fake.delay = 0.25
+        words = list(range(10))
+        events, text, _ = await run_session(self.port, [speech(words)], pace=True, speed=8)
+        after = self.completed(events, True)
         self.assertEqual(len(after), 1)
-        self.assertEqual(text, "seg1 seg2")
+        self.assertEqual(text, " ".join("w%d" % k for k in words))
 
-    async def test_pauseless_speech_pushes_settled_partials(self):
-        # 7s of continuous "speech": no segment cut, but partials should be posted
-        # (every ~3s of speech) and the final commit must still be a single event.
-        events, text, _ = await run_session(self.port, [tone_burst(7.0)], pace=False)
-        await asyncio.sleep(0.3)
-        partials = [p for p in self.precached if p.startswith("Partial sentence")]
-        self.assertGreaterEqual(len(partials), 1, self.precached)
-        completed = [e for e in events if e["type"].endswith("completed")]
-        self.assertEqual(len(completed), 1)
-        self.assertEqual(text, "seg1")
+    async def test_silence_only_windows_are_skipped(self):
+        events, text, _ = await run_session(self.port, [speech([1, 2]), silence(6.0)], pace=True, speed=8)
+        # 8s of audio would schedule ~3 windows; the digital-silence ones cost nothing
+        self.assertLessEqual(len(self.fake.calls), 3)
+        self.assertEqual(text, "w1 w2")
 
     async def test_short_tail_yields_empty_final_but_still_resolves(self):
-        events, text, _ = await run_session(self.port, [tone_burst(3.5), silence(1.2), silence(0.05)])
-        after = [e for e in events if e["type"].endswith("completed") and e["_after_commit"]]
+        events, text, _ = await run_session(self.port, [silence(0.05)])
+        after = self.completed(events, True)
         self.assertEqual(len(after), 1)
-        self.assertEqual(text, "seg1")
+        self.assertEqual(text, "")
+
+    async def test_heartbeat_touches_the_model_only_while_idle(self):
+        stt_server.HEARTBEAT_S = 0.15
+        state = self.app["state"]
+        state.last_work = time.monotonic() - 10
+        task = asyncio.ensure_future(stt_server.heartbeat(self.app))
+        try:
+            await asyncio.sleep(0.5)
+            self.assertGreaterEqual(self.fake.pokes, 1, "idle → weights are touched")
+            # an open session suspends it (the user is dictating; the GPU is busy for them)
+            state.sessions = 1
+            state.last_work = time.monotonic() - 10
+            before = self.fake.pokes
+            await asyncio.sleep(0.4)
+            self.assertEqual(self.fake.pokes, before, "no heartbeat while a session is open")
+        finally:
+            task.cancel()
+            state.sessions = 0
 
     async def test_batch_endpoint_wav(self):
-        import io
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
-            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
-            w.writeframes((tone_burst(1.0) * 32767).astype("<i2").tobytes())
-        from aiohttp import FormData
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
+            w.writeframes((speech([4, 5]) * 32767).astype("<i2").tobytes())
         fd = FormData()
         fd.add_field("file", buf.getvalue(), filename="a.wav", content_type="audio/wav")
         fd.add_field("model", "x")
@@ -215,25 +276,99 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
             async with cs.post("http://127.0.0.1:%d/v1/audio/transcriptions" % self.port, data=fd) as r:
                 self.assertEqual(r.status, 200)
                 body = await r.json()
-        self.assertEqual(body["text"], "seg1")
-        self.assertAlmostEqual(body["duration"], 1.0, delta=0.01)
+        self.assertEqual(body["text"], "w4 w5")
+        self.assertAlmostEqual(body["duration"], 1.1, delta=0.01)
+
+    async def test_health_reports_memory(self):
+        async with ClientSession() as cs:
+            async with cs.get("http://127.0.0.1:%d/health" % self.port) as r:
+                body = await r.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["sessions"], 0)
+        self.assertEqual(body["source_sha"], stt_server.source_sha(), "health reports which source is running")
+
+
+class SettleAndSpliceTests(unittest.TestCase):
+    W = stt_server.Word
+
+    def test_agreement_ignores_punctuation_and_needs_horizon(self):
+        prev = [self.W(" so", 0.0, 0.2), self.W(" the", 0.3, 0.4), self.W(" deploy", 0.5, 0.9), self.W(" is", 1.0, 1.1)]
+        cur = [self.W(" So", 0.0, 0.2), self.W(" the", 0.3, 0.4), self.W(" deploy,", 0.5, 0.9), self.W(" is", 1.0, 1.1),
+               self.W(" done", 1.2, 1.5)]
+        # window ends at 2.6s: "is" ended at 1.1 (≥1s before) → settle 4 words; "done" too recent
+        self.assertEqual(stt_server.agreed_settle_count(prev, cur, 2.6, 0.0), 4)
+        # nothing agreed → nothing settles; a too-short span → nothing either
+        self.assertEqual(stt_server.agreed_settle_count(prev, [self.W(" no", 0.0, 0.2)], 2.6, 0.0), 0)
+        self.assertEqual(stt_server.agreed_settle_count(prev, cur, 2.6, 0.5), 0)
+
+    def test_splice_anchors_on_words_not_time(self):
+        settled = [self.W(" hello", 0.0, 0.4), self.W(" there", 0.5, 0.9), self.W(" world", 1.0, 1.4)]
+        # the commit decode re-tokenises the boundary ("world" → "world!") and shifts it 0.3s
+        commit = [self.W(" hello", 0.0, 0.4), self.W(" there", 0.5, 0.9), self.W(" world!", 1.1, 1.7),
+                  self.W(" and", 1.8, 2.0), self.W(" more", 2.1, 2.4)]
+        tail = stt_server.splice_tail(commit, settled, cut=1.5)
+        self.assertEqual(stt_server.words_text(tail), "and more")
+        # no anchor found → timestamp fallback, with the boundary duplicate dropped
+        tail = stt_server.splice_tail([self.W(" world", 1.45, 1.7), self.W(" and", 1.8, 2.0)], settled[-1:], cut=1.5)
+        self.assertEqual(stt_server.words_text(tail), "and")
+        self.assertEqual(stt_server.words_text(stt_server.splice_tail(commit, [], cut=1.5)), "and more")
+
+    def test_splice_prefers_the_anchor_match_closest_to_the_cut(self):
+        settled = [self.W(" and", 0.5, 0.7), self.W(" the", 0.8, 0.9)]
+        commit = [self.W(" and", 0.5, 0.7), self.W(" the", 0.8, 0.9), self.W(" thing", 1.0, 1.3),
+                  self.W(" and", 1.4, 1.6), self.W(" the", 1.7, 1.8), self.W(" rest", 1.9, 2.2)]
+        tail = stt_server.splice_tail(commit, settled, cut=0.95)
+        self.assertEqual(stt_server.words_text(tail), "thing and the rest", "the later repeat must not swallow 'thing'")
+
+
+class StreamResamplerTests(unittest.TestCase):
+    def test_chunked_output_matches_whole_clip_resampling(self):
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal(24000 * 3).astype(np.float32) * 0.1
+        whole = stt_server.resample(x, 24000, 16000)
+        rs = stt_server.StreamResampler(24000)
+        parts = [rs.feed(x[i:i + 2400]) for i in range(0, len(x), 2400)]
+        parts.append(rs.feed(np.zeros(0, dtype=np.float32), final=True))
+        streamed = np.concatenate(parts)
+        self.assertEqual(len(streamed), len(whole))
+        # everything but the very last few samples (no right context at flush) is identical
+        self.assertTrue(np.allclose(streamed[:-200], whole[:-200], atol=1e-4))
+        # stateless per-message resampling is what we are replacing: visibly different
+        naive = np.concatenate([stt_server.resample(x[i:i + 2400], 24000, 16000) for i in range(0, len(x), 2400)])
+        self.assertFalse(np.allclose(naive[:-200], whole[:-200], atol=1e-4))
+
+    def test_same_rate_is_passthrough(self):
+        rs = stt_server.StreamResampler(16000)
+        x = np.ones(100, dtype=np.float32)
+        self.assertIs(rs.feed(x), x)
+
+
+class WordMergeTests(unittest.TestCase):
+    def test_subword_and_punctuation_tokens_attach_to_their_word(self):
+        toks = [FakeToken(" inv", 0.0, 0.2), FakeToken("ite", 0.2, 0.4), FakeToken("?", 0.4, 0.5), FakeToken(" Ok", 0.9, 1.1)]
+        words = stt_server.words_from_tokens(toks, offset=10.0)
+        self.assertEqual([w.text for w in words], [" invite?", " Ok"])
+        self.assertAlmostEqual(words[0].start, 10.0)
+        self.assertAlmostEqual(words[0].end, 10.5)
+        self.assertEqual(stt_server.words_text(words), "invite? Ok")
 
 
 async def real_run(path, pace):
     print("loading model …")
-    tr = stt_server.Transcriber(stt_server.MODEL_ID)
-    app = make_app(tr)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    tr = executor.submit(stt_server.Transcriber, stt_server.MODEL_ID).result()
+    app = stt_server.make_app(tr, executor)
     runner = web.AppRunner(app); await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0); await site.start()
     port = site._server.sockets[0].getsockname()[1]
     with wave.open(path) as w:
-        assert w.getframerate() == 16000 and w.getnchannels() == 1 and w.getsampwidth() == 2
+        assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2
         x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
     t0 = time.monotonic(); batch = tr.transcribe(x); tb = time.monotonic() - t0
     events, text, lat = await run_session(port, [x], pace=pace)
     segs = [e for e in events if e["type"].endswith("completed")]
     print("\naudio %.1fs  batch=%.2fs  realtime commit→final=%.3fs  (%d completed events, %d mid-speech)" % (
-        len(x) / 16000, tb, lat, len(segs), sum(1 for e in segs if not e["_after_commit"])))
+        len(x) / SR, tb, lat, len(segs), sum(1 for e in segs if not e["_after_commit"])))
     print("  batch   :", batch[:200])
     print("  realtime:", text[:200])
     await runner.cleanup()

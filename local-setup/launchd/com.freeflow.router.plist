@@ -40,7 +40,18 @@
         <!-- Should match OLLAMA_KEEP_ALIVE in com.freeflow.ollama.plist. -->
         <key>LOCAL_KEEPALIVE_S</key>
         <string>1800</string>
+        <!-- 0: Groq first, local as the offline/quota fallback (the base model is the
+             weaker cleaner). 1: local first — worth it once you have a fine-tune
+             you trust. Dictations that clean deterministically never reach either. -->
         <key>FORCE_LOCAL</key>
+        <string>0</string>
+        <!-- Touch the local model this often while idle so macOS never pages its
+             weights out (a model idle for ten minutes cost 7–11s on the next request). -->
+        <key>LOCAL_HEARTBEAT_S</key>
+        <string>60</string>
+        <!-- 1: let the local model pre-clean chunks the deterministic cleaner declines.
+             Leave at 0 with the base model: such dictations are cleaned whole at commit. -->
+        <key>PRECACHE_LLM</key>
         <string>0</string>
     </dict>
     <key>RunAtLoad</key>

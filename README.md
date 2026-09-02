@@ -47,26 +47,37 @@ layout, whether a closing period belongs, and whether the text is prose at all.
 are captured passively and mined for repeated single-word fixes, which become
 custom vocabulary automatically.
 
-**Speculative cleanup while you talk.** The STT server posts settled sentences
-to the router mid-dictation; at key-up the router substitutes the already-cleaned
-prefix and only generates the tail.
+**Words settle while you talk.** The STT server re-transcribes a sliding window
+every two seconds and, whenever two consecutive windows agree on a word that is
+comfortably behind the live edge, hands it to the app and to the router. The
+audio is never cut, so nothing is decoded without context. At key-up only the
+last few seconds are left to transcribe — ~0.2s, whether you spoke for five
+seconds or five minutes — and a dictation whose settled chunks all cleaned
+deterministically is assembled by the router in ~10ms with no model at all.
+
+**It cannot eat the machine.** The STT process caps MLX's buffer cache, wires
+its weights and touches them while idle. (Uncapped, it had grown to 17 GB and
+swapped out everything, including itself: every dictation after a break paid
+7–13 seconds of page-ins.)
 
 ## The pipeline
 
 ```
-hotkey down ──► audio ──► Parakeet-TDT STT server  :8082   (streaming, ~0.1s tail at key-up)
-                             │
-                             ├─ settled sentences ──► router /v1/precache  (cleaned early)
-                             │
-hotkey up ───► final transcript
+hotkey down ──► audio ──► Parakeet-TDT STT server  :8082
+                             │  sliding-window re-decode every 2s; words the last two
+                             │  windows agree on are *settled*
+                             ├─ settled words ──► app (live text) + router /v1/precache
+                             │                    (cleaned deterministically, as fragments)
+hotkey up ───► only the unsettled tail is decoded (~0.2s) ──► final transcript
                              │
                    ┌─────────┴──────────┐
-                   │  deterministic?    │  TranscriptFastPath — ~0ms, no model
+                   │  deterministic?    │  TranscriptFastPath (≤60 words) — ~0ms, no model
                    └─────────┬──────────┘
                              │ needs judgement
                              ▼
-                     router :11435 ──► local mlx_lm Qwen :8081   (FORCE_LOCAL=1)
-                                   └─► Groq chain                (rate-limit aware fallback)
+                     router :11435 ──► pre-cleaned chunks + deterministic tail → assembled, ~10ms
+                                   ├─► Groq chain (hosted-first, rate-limit aware)
+                                   └─► local mlx_lm Qwen :8081  (offline / quota fallback, FORCE_LOCAL=1 to prefer)
                              │
                              ▼
                     paste at cursor (Cmd-V, original clipboard restored)
@@ -76,7 +87,8 @@ Services run under `launchd` (`com.freeflow.stt`, `com.freeflow.router`,
 `com.freeflow.localmodel`). The repo is the source of truth — deploy with:
 
 ```bash
-cp local-setup/router.py local-setup/detclean.py ~/.freeflow-stt/ && launchctl kickstart -k gui/$UID/com.freeflow.router
+local-setup/deploy.sh            # run the suites, copy, restart, and confirm the running hashes match the repo
+local-setup/deploy.sh --check    # just compare what is running with the checkout
 ```
 
 ## Destination profiles
@@ -179,25 +191,30 @@ the global hotkey needs all three.
 
 ```bash
 make check                                    # typecheck + Swift tests + plist/YAML validation
-python3 local-setup/test_router.py            # router: rate limits, fallback, precache
+python3 local-setup/test_router.py            # router: rate limits, fallback, precache, and the app's request shape pinned to the Swift source
 python3 local-setup/test_detclean.py          # deterministic cleanup, pinned to the Swift output
-~/.freeflow-ft/venv/bin/python local-setup/test_stt_server.py   # STT protocol (needs numpy)
+~/.freeflow-ft/venv/bin/python local-setup/test_stt_server.py   # STT protocol, settling, splicing, resampling (needs numpy)
 ```
 
 ```bash
-~/.freeflow-ft/venv/bin/python local-setup/bench_e2e.py --files 8   # key-up → cleaned, end to end
+~/.freeflow-ft/venv/bin/python local-setup/bench_e2e.py --files 8   # key-up → cleaned, end to end, plus streamed-vs-batch WER
 ~/.freeflow-ft/venv/bin/python local-setup/eval_models.py           # WER + latency per backend
 ```
 
 `bench_e2e.py --target chat|email|terminal|…` measures a specific destination.
 Benchmark on an idle machine — GPU contention from anything else on the box
-moves these numbers far more than most code changes do.
+moves these numbers far more than most code changes do. The `WERvsB` column is
+the accuracy cost of streaming and should stay near zero; on real recordings the
+only differences are fillers and stutters Parakeet itself decodes inconsistently.
 
 ## Debugging
 
 | Where | What's in it |
 |---|---|
 | `~/.freeflow-stt/router.log` | Per-request route, deadline, latency, precache hits |
+| `~/.freeflow-stt/stt-server.log` | One `settled:` line per chunk while you talk, one `commit:` line per dictation (tail length, window, latency) |
+| `curl 127.0.0.1:8082/health` | STT process memory (`active_mb` ≈ weights, `cache_mb` must stay at the cap) |
+| Run log status (Debug panel) | Ends in `0.42s (stt 0.11s · context 0.00s · cleanup 0.31s)` — what you waited after key-up, and where |
 | `~/.freeflow-stt/stt-server.log` | Segment cuts, commit timing, partials posted |
 | `curl 127.0.0.1:11435/v1/status` | What the router believes about each Groq bucket and the local model |
 | Run Log (in-app) | Raw vs cleaned transcript, prompts, context, screenshot, corrections |

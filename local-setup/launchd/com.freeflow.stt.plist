@@ -22,10 +22,22 @@
         <string>mlx-community/parakeet-tdt-0.6b-v2</string>
         <key>STT_PORT</key>
         <string>8082</string>
-        <key>STT_PAUSE_S</key>
-        <string>0.8</string>
-        <key>STT_MIN_SEGMENT_S</key>
-        <string>3.0</string>
+        <!-- Streaming: decode a window every 2s; settle words the last two windows agree
+             on that ended ≥1s before the live edge; keep 10s of settled audio as context. -->
+        <key>STT_PARTIAL_EVERY_S</key>
+        <string>2.0</string>
+        <key>STT_SETTLE_HORIZON_S</key>
+        <string>1.0</string>
+        <key>STT_LEFT_CONTEXT_S</key>
+        <string>10.0</string>
+        <!-- Memory: cap MLX's buffer cache (uncapped it grew to 17 GB and swapped the
+             machine), wire the weights, and touch them while idle so they stay resident. -->
+        <key>STT_CACHE_MB</key>
+        <string>512</string>
+        <key>STT_WIRED_MB</key>
+        <string>2048</string>
+        <key>STT_HEARTBEAT_S</key>
+        <string>45</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

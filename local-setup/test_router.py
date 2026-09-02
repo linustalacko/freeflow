@@ -100,6 +100,7 @@ os.environ.update({
 })
 sys.path.insert(0, HERE)
 import router  # noqa: E402  (must import after env is set)
+import app_prompt  # noqa: E402
 
 ROUTER = ThreadingHTTPServer(("127.0.0.1", 0), router.Handler)
 ROUTER.daemon_threads = True
@@ -125,13 +126,19 @@ DEFAULT_SYS = "You are a literal dictation cleanup layer for short messages.\n\n
 
 
 def cleanup_payload(model="primary", text="um so hello world", context="", system=DEFAULT_SYS):
-    """Byte-for-byte the shape PostProcessingService.process sends."""
-    user = ('Instructions: Clean up RAW_TRANSCRIPTION and return only the cleaned transcript '
-            'text without surrounding quotes. Return EMPTY if there should be no result.\n\n'
-            f'CONTEXT: "{context}"\n\nRAW_TRANSCRIPTION: "{text}"')
-    return {"model": model, "temperature": 0, "max_completion_tokens": 400,
-            "reasoning_effort": "low", "include_reasoning": False,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    """Byte-for-byte the shape PostProcessingService.process sends (see app_prompt.py)."""
+    body = app_prompt.cleanup_request(system, text, context, model=model)
+    body["max_completion_tokens"] = 400
+    return body
+
+
+def image_payload(model="ctx-model", max_completion_tokens=512):
+    """The context-inference call AppContextService makes at hotkey-down."""
+    return {"model": model, "temperature": 0.2, "max_completion_tokens": max_completion_tokens,
+            "messages": [{"role": "system", "content": "You are a context synthesis assistant."},
+                         {"role": "user", "content": [
+                             {"type": "text", "text": "Analyze the screenshot plus metadata."},
+                             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + "A" * 120000}}]}]}
 
 
 def app_payload(model="primary", text="um so hello world"):
@@ -158,6 +165,8 @@ class RouterTests(unittest.TestCase):
             router._precache.clear()
         router.LOCAL_PROMPT_FORMAT = "passthrough"
         router.DET_CLEAN = False  # most tests exercise the LLM plumbing; see test_deterministic_*
+        router.PRECACHE_LLM = True  # the LLM plumbing tests pre-clean chunks with the fake model
+        router._local_last_call = 0.0
         router._reset_hosted_breaker()
         router._dns_cache.clear()
 
@@ -552,6 +561,137 @@ class RouterTests(unittest.TestCase):
             router._reset_hosted_breaker()
             router._dns_cache.clear()
 
+    # ---- the app's request shape --------------------------------------------
+    def test_app_prompt_matches_swift_source(self):
+        """app_prompt.cleanup_user_message must be what PostProcessingService.process
+        sends, or the router silently stops recognising cleanups (it did, for two
+        months, after upstream switched to the heredoc format)."""
+        swift = open(os.path.join(HERE, "..", "Sources", "PostProcessingService.swift")).read()
+        marker = 'let userMessage = """\nInstructions: Clean up RAW_TRANSCRIPTION'
+        start = swift.index(marker) + len('let userMessage = """\n')
+        block = swift[start:]
+        block = block[:block.index('\n"""')]
+        rendered = block.replace("\\(contextSummary)", "CTX").replace("\\(transcript)", "RAW")
+        self.assertEqual(rendered, app_prompt.cleanup_user_message("RAW", "CTX"))
+
+    def test_both_cleanup_prompt_formats_are_recognised(self):
+        raw = "um so\nhello world"
+        for content in (app_prompt.cleanup_user_message(raw, "In Slack"),
+                        app_prompt.legacy_cleanup_user_message(raw, "In Slack")):
+            self.assertEqual(router.parse_cleanup_user(content), ("In Slack", raw))
+            self.assertTrue(router.is_cleanup_request({"messages": [{"role": "user", "content": content}]}))
+        self.assertFalse(router.is_cleanup_request({"messages": [{"role": "user", "content": "Analyze the context"}]}))
+        self.assertFalse(router.is_cleanup_request(image_payload()))
+        # the train-format rewrite sees through the heredoc too
+        out = router.to_train_format([{"role": "system", "content": "S"},
+                                      {"role": "user", "content": app_prompt.cleanup_user_message(raw, "")}])
+        self.assertEqual(out[1]["content"], "Raw transcript:\num so\nhello world\n\nClean this up into the final text.")
+
+    # ---- image (context) requests --------------------------------------------
+    def test_images_are_priced_per_image_not_per_base64_char(self):
+        cost = router._estimate_cost_tokens(image_payload())
+        self.assertLess(cost, router.GROQ_IMAGE_TOKENS + 512 + 200)
+        self.assertGreater(cost, router.GROQ_IMAGE_TOKENS)
+        self.assertTrue(router._has_image(image_payload()))
+        self.assertFalse(router._has_image(cleanup_payload()))
+
+    def test_local_refuses_image_requests_instantly(self):
+        GROQ.script["ctx-model"] = rate_limited("60")
+        GROQ.script["fallback-a"] = rate_limited("60")
+        GROQ.script["fallback-b"] = rate_limited("60")
+        LOCAL.script["local-model"] = ok("should never be asked")
+        t0 = time.monotonic()
+        status, _, _, _ = post(image_payload())
+        self.assertIn(status, (502, 504))
+        self.assertLess(time.monotonic() - t0, 1.0, "the local refusal must not wait on anything")
+        self.assertEqual(LOCAL.requests, [], "a text-only server must never see an image request")
+
+    def test_image_request_completion_budget_is_capped(self):
+        GROQ.script["ctx-model"] = ok("Two sentences.")
+        _, headers, _, _ = post(image_payload(max_completion_tokens=512))
+        self.assertEqual(headers.get("X-FreeFlow-Route"), "groq:ctx-model")
+        self.assertEqual(GROQ.requests[-1]["max_completion_tokens"], router.CONTEXT_MAX_COMPLETION_TOKENS)
+        # cleanup budgets are the app's business
+        GROQ.script["primary"] = ok("x")
+        post(cleanup_payload())
+        self.assertEqual(GROQ.requests[-1]["max_completion_tokens"], 400)
+
+    # ---- deterministic precache (no model at all) ----------------------------
+    def test_deterministic_precache_answers_without_any_model(self):
+        router.DET_CLEAN = True
+        router.PRECACHE_LLM = False
+        GROQ.script["primary"] = ok("hosted")
+        post(cleanup_payload(text="teach the system prompt"))  # hosted-first; teaches the router the prompt
+        for seg in ("Um, so the first part is done.", "and the second part too,"):
+            post({"raw": seg}, path="/precache")
+        self._wait_precache_done()
+        with GROQ.lock:
+            GROQ.requests.clear()
+        full = "Um, so the first part is done. and the second part too, uh and here is the tail"
+        status, headers, body, _ = post(cleanup_payload(text=full))
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("X-FreeFlow-Route"), "precache")
+        self.assertEqual(body["choices"][0]["message"]["content"],
+                         "So the first part is done. And the second part too, and here is the tail.")
+        self.assertEqual(GROQ.requests, [])
+        self.assertEqual(LOCAL.requests, [])
+        with router._precache_lock:
+            self.assertEqual(router._precache, [], "used entries are consumed")
+
+    def test_precache_chunk_needing_the_model_is_left_for_commit(self):
+        router.DET_CLEAN = True
+        router.PRECACHE_LLM = False
+        GROQ.script["primary"] = ok("Let's meet Wednesday.")
+        post(cleanup_payload(text="teach"))
+        post({"raw": "let's meet Thursday no actually Wednesday"}, path="/precache")
+        self._wait_precache_done()
+        with router._precache_lock:
+            self.assertIsNone(router._precache[0]["cleaned"])
+        self.assertEqual(LOCAL.requests, [], "PRECACHE_LLM=0: the small model must not judge a self-correction")
+        with GROQ.lock:
+            GROQ.requests.clear()
+        _, headers, body, _ = post(cleanup_payload(text="let's meet Thursday no actually Wednesday and that's it"))
+        self.assertEqual(headers.get("X-FreeFlow-Route"), "groq:primary", "cleaned whole, by the normal chain")
+        self.assertIn("Thursday no actually Wednesday and that's it", GROQ.requests[0]["messages"][-1]["content"])
+        self.assertEqual(body["choices"][0]["message"]["content"], "Let's meet Wednesday.")
+
+    def test_fragment_assembly_keeps_sentence_flow(self):
+        # Chunks settle mid-sentence. Cleaning each as a sentence would give
+        # "…should be. An action." — fragments are cased and closed as a whole.
+        router.DET_CLEAN = True
+        router.PRECACHE_LLM = False
+        GROQ.script["primary"] = ok("hosted")
+        post(cleanup_payload(text="teach"))
+        for seg in ("hold up the pendant should be", "an action. or you should see her"):
+            post({"raw": seg}, path="/precache")
+        self._wait_precache_done()
+        _, headers, body, _ = post(cleanup_payload(text="hold up the pendant should be an action. or you should see her um holding it out"))
+        self.assertEqual(headers.get("X-FreeFlow-Route"), "precache")
+        self.assertEqual(body["choices"][0]["message"]["content"],
+                         "Hold up the pendant should be an action. Or you should see her holding it out.")
+        # a chat destination: no closing period on a single short line either way
+        chat_sys = DEFAULT_SYS + "\n\nDestination:\n- The text is going into a chat message. Keep it casual."
+        post(cleanup_payload(text="teach", system=chat_sys))
+        post({"raw": "sounds good"}, path="/precache")
+        self._wait_precache_done()
+        _, headers, body, _ = post(cleanup_payload(text="sounds good to me", system=chat_sys))
+        self.assertEqual(headers.get("X-FreeFlow-Route"), "precache")
+        self.assertEqual(body["choices"][0]["message"]["content"], "Sounds good to me")
+
+    def test_local_heartbeat_touches_the_model_only_when_idle(self):
+        LOCAL.script["local-model"] = ok("")
+        saved = router.LOCAL_HEARTBEAT_S
+        router.LOCAL_HEARTBEAT_S = 0.2
+        try:
+            router._local_last_call = 0.0
+            self.assertTrue(router.heartbeat_tick())
+            self.assertEqual(len(LOCAL.requests), 1)
+            self.assertEqual(LOCAL.requests[0]["max_tokens"], 1)
+            self.assertFalse(router.heartbeat_tick(), "just touched → nothing to do")
+            self.assertEqual(len(LOCAL.requests), 1)
+        finally:
+            router.LOCAL_HEARTBEAT_S = saved
+
     def test_parse_reset_formats(self):
         p = router.RateLimits._parse_reset
         self.assertAlmostEqual(p("23.835s"), 23.835)
@@ -560,6 +700,14 @@ class RouterTests(unittest.TestCase):
         self.assertAlmostEqual(p("2h3m"), 7380)
         self.assertAlmostEqual(p("6"), 6)
         self.assertIsNone(p(""))
+
+    def test_status_reports_running_source_and_policy(self):
+        req = urllib.request.Request(ROUTER_URL + "/status")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = json.loads(r.read())
+        self.assertEqual(status["source_sha"], router.source_sha())
+        for key in ("force_local", "precache_llm", "local_heartbeat_s", "local_warm"):
+            self.assertIn(key, status)
 
     def test_models_endpoint_lists_fallbacks_and_local(self):
         req = urllib.request.Request(ROUTER_URL + "/models")
