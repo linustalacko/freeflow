@@ -18,46 +18,24 @@ struct ShortcutInputState: Equatable {
     var holdIsActive = false
     var toggleIsActive = false
     var copyAgainIsActive = false
+    var editLastIsActive = false
+    var draftReplyIsActive = false
 
     var currentModifiers: ShortcutModifiers {
         ShortcutBinding.modifiers(for: pressedModifierKeyCodes)
     }
 
     func hasPressedShortcutInputs(configuration: ShortcutConfiguration) -> Bool {
-        let currentModifiers = currentModifiers
-        let keyReferenceHeld = pressedKeyCodes.contains { keyCode in
-            let isHoldKey = configuration.hold.kind == .key && configuration.hold.keyCode == keyCode
-            let isToggleKey = configuration.toggle.kind == .key && configuration.toggle.keyCode == keyCode
-            let isCopyAgainKey = configuration.copyAgain.kind == .key && configuration.copyAgain.keyCode == keyCode
-            return isHoldKey || isToggleKey || isCopyAgainKey
-        }
-        if keyReferenceHeld {
-            return true
-        }
-
-        if configuration.hold.referencesPressedModifiers(
-            pressedModifierKeyCodes: pressedModifierKeyCodes,
-            currentModifiers: currentModifiers,
-            permittedAdditionalExactMatchModifiers: configuration.permittedAdditionalExactMatchModifiers
-        ) {
-            return true
-        }
-
-        if configuration.toggle.referencesPressedModifiers(
-            pressedModifierKeyCodes: pressedModifierKeyCodes,
-            currentModifiers: currentModifiers,
-            permittedAdditionalExactMatchModifiers: configuration.permittedAdditionalExactMatchModifiers
-        ) {
-            return true
-        }
-
-        if configuration.copyAgain.referencesPressedModifiers(
-            pressedModifierKeyCodes: pressedModifierKeyCodes,
-            currentModifiers: currentModifiers,
-            permittedAdditionalExactMatchModifiers: configuration.permittedAdditionalExactMatchModifiers
-        ) {
-            return true
-        }
+        if pressedKeyCodes.contains(where: { key in
+            configuration.allBindings.contains { $0.kind == .key && $0.keyCode == key }
+        }) { return true }
+        if configuration.allBindings.contains(where: {
+            $0.referencesPressedModifiers(
+                pressedModifierKeyCodes: pressedModifierKeyCodes,
+                currentModifiers: currentModifiers,
+                permittedAdditionalExactMatchModifiers: configuration.permittedAdditionalExactMatchModifiers
+            )
+        }) { return true }
 
         return false
     }
@@ -179,7 +157,17 @@ enum ShortcutMatcher {
         state.toggleIsActive = bindingIsActive(configuration.toggle, state: state, configuration: configuration)
         state.copyAgainIsActive = bindingIsActive(configuration.copyAgain, state: state, configuration: configuration)
 
-        return emitChanges(
+        let editLast = bindingIsActive(configuration.editLast, state: state, configuration: configuration)
+        let draftReply = bindingIsActive(configuration.draftReply, state: state, configuration: configuration)
+        var writingEvents: [ShortcutEvent] = []
+        if editLast && !state.editLastIsActive { writingEvents.append(.writingTriggered(.editLast)) }
+        if draftReply && !state.draftReplyIsActive { writingEvents.append(.writingTriggered(.draftReply)) }
+        // One trigger per physical press, even if extra modifiers are pressed
+        // and released while the shortcut's primary key stays down.
+        state.editLastIsActive = (state.editLastIsActive || editLast) && primaryInputIsPressed(configuration.editLast, state: state)
+        state.draftReplyIsActive = (state.draftReplyIsActive || draftReply) && primaryInputIsPressed(configuration.draftReply, state: state)
+
+        return writingEvents + emitChanges(
             previousHold: previousHold,
             previousToggle: previousToggle,
             previousCopyAgain: previousCopyAgain,
@@ -231,10 +219,15 @@ enum ShortcutMatcher {
     ) -> Bool {
         guard !binding.isDisabled else { return false }
         let activeModifiers = state.currentModifiers
+        if binding == configuration.editLast || binding == configuration.draftReply {
+            let primaryModifier = binding.kind == .modifierKey ? ShortcutBinding.modifier(forKeyCode: binding.keyCode) ?? [] : []
+            guard activeModifiers == binding.modifiers.union(primaryModifier) else { return false }
+        }
         guard binding.modifiersAreActive(
             pressedModifierKeyCodes: state.pressedModifierKeyCodes,
             currentModifiers: activeModifiers,
-            permittedAdditionalExactMatchModifiers: configuration.permittedAdditionalExactMatchModifiers
+            permittedAdditionalExactMatchModifiers: (binding == configuration.editLast || binding == configuration.draftReply)
+                ? [] : configuration.permittedAdditionalExactMatchModifiers
         ) else {
             return false
         }
@@ -246,6 +239,14 @@ enum ShortcutMatcher {
             return state.pressedKeyCodes.contains(binding.keyCode)
         case .modifierKey:
             return state.pressedModifierKeyCodes.contains(binding.keyCode)
+        }
+    }
+
+    private static func primaryInputIsPressed(_ binding: ShortcutBinding, state: ShortcutInputState) -> Bool {
+        switch binding.kind {
+        case .key: return state.pressedKeyCodes.contains(binding.keyCode)
+        case .modifierKey: return state.pressedModifierKeyCodes.contains(binding.keyCode)
+        case .disabled: return false
         }
     }
 
@@ -273,7 +274,7 @@ enum ShortcutMatcher {
         for keyCode: UInt16,
         configuration: ShortcutConfiguration
     ) -> [ShortcutBinding] {
-        [configuration.hold, configuration.toggle, configuration.copyAgain].filter { binding in
+        configuration.allBindings.filter { binding in
             binding.kind == .key && binding.keyCode == keyCode
         }
     }
@@ -282,7 +283,7 @@ enum ShortcutMatcher {
         for keyCode: UInt16,
         configuration: ShortcutConfiguration
     ) -> [ShortcutBinding] {
-        [configuration.hold, configuration.toggle, configuration.copyAgain].filter { binding in
+        configuration.allBindings.filter { binding in
             switch binding.kind {
             case .key, .modifierKey:
                 return modifierEvent(for: keyCode, affects: binding)

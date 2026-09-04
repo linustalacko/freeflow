@@ -56,12 +56,16 @@ enum ShortcutRole {
     case hold
     case toggle
     case copyAgain
+    case editLast
+    case draftReply
 
     var title: String {
         switch self {
         case .hold: return "Hold to Talk"
         case .toggle: return "Tap to Toggle"
         case .copyAgain: return "Paste Again"
+        case .editLast: return "Edit Last Dictation"
+        case .draftReply: return "Draft Gmail Reply"
         }
     }
 }
@@ -72,23 +76,36 @@ enum ShortcutEvent: Equatable {
     case toggleActivated
     case toggleDeactivated
     case copyAgainTriggered
+    case writingTriggered(VoiceWritingAction)
 }
 
 struct ShortcutConfiguration: Equatable {
     let hold: ShortcutBinding
     let toggle: ShortcutBinding
     let copyAgain: ShortcutBinding
+    let editLast: ShortcutBinding
+    let draftReply: ShortcutBinding
+    var allBindings: [ShortcutBinding] { [hold, toggle, copyAgain, editLast, draftReply] }
     let permittedAdditionalExactMatchModifiers: ShortcutModifiers
 
     init(
         hold: ShortcutBinding,
         toggle: ShortcutBinding,
         copyAgain: ShortcutBinding = .disabled,
+        editLast: ShortcutBinding = .disabled,
+        draftReply: ShortcutBinding = .disabled,
         permittedAdditionalExactMatchModifiers: ShortcutModifiers = []
     ) {
         self.hold = hold
         self.toggle = toggle
         self.copyAgain = copyAgain
+        let ordinaryBindings = [hold, toggle, copyAgain]
+        let possibleBindings = ordinaryBindings + (permittedAdditionalExactMatchModifiers.isEmpty ? [] : [
+            hold.withAddedModifiers(permittedAdditionalExactMatchModifiers),
+            toggle.withAddedModifiers(permittedAdditionalExactMatchModifiers)
+        ])
+        self.editLast = possibleBindings.contains { editLast.overlapsWritingShortcut($0) } ? .disabled : editLast
+        self.draftReply = (possibleBindings + [editLast]).contains { draftReply.overlapsWritingShortcut($0) } ? .disabled : draftReply
         self.permittedAdditionalExactMatchModifiers = permittedAdditionalExactMatchModifiers
     }
 
@@ -268,6 +285,28 @@ struct ShortcutBinding: Codable, Hashable, Identifiable, Equatable {
             }
         }
 
+        return false
+    }
+
+    /// Writing is a separate session, so reject overlap even when specificity
+    /// differs. A modifier-only dictation can fire before a writing chord's key.
+    func overlapsWritingShortcut(_ other: ShortcutBinding) -> Bool {
+        guard !isDisabled, !other.isDisabled else { return false }
+        if kind == .modifierKey || other.kind == .modifierKey {
+            func required(_ binding: ShortcutBinding) -> ShortcutModifiers {
+                guard binding.kind == .modifierKey,
+                      let primary = Self.modifier(forKeyCode: binding.keyCode) else { return binding.modifiers }
+                return binding.modifiers.union(primary)
+            }
+            return (kind == .modifierKey && required(self).isSubset(of: required(other)))
+                || (other.kind == .modifierKey && required(other).isSubset(of: required(self)))
+        }
+        guard keyCode == other.keyCode else { return false }
+        let codes = Array(Self.modifierKeyCodes).sorted()
+        for mask in 0..<(1 << codes.count) {
+            let pressed = Set(codes.enumerated().compactMap { index, code in (mask & (1 << index)) == 0 ? nil : code })
+            if isActive(for: pressed) && other.isActive(for: pressed) { return true }
+        }
         return false
     }
 

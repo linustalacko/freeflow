@@ -19,6 +19,7 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
 	Sources/ModelConfiguration.swift \
+	Sources/PostProcessingService.swift \
 	Sources/RealtimeTranscriptState.swift \
 	Sources/RealtimeTranscriptionService.swift \
 	Sources/SpokenFormatting.swift \
@@ -26,6 +27,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/TranscriptTextCore.swift \
 	Sources/UpdateManager.swift \
 	Sources/VocabularyLearner.swift \
+	Sources/VoiceWritingCore.swift \
+	Sources/VoiceWritingTargetService.swift \
 	Sources/ShortcutCore/DictationShortcutSessionController.swift \
 	Sources/ShortcutCore/ShortcutMatcher.swift \
 	Sources/ShortcutCore/ShortcutModels.swift

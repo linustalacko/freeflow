@@ -132,6 +132,7 @@ Behavior:
 - Do not treat VOICE_COMMAND as dictation to clean up and paste directly.
 """
 
+    private let sendRequest: (URLRequest) async throws -> (Data, URLResponse)
     private let apiKey: String
     private let baseURL: String
     private let preferredModel: String
@@ -151,8 +152,10 @@ Behavior:
         baseURL: String = "https://api.groq.com/openai/v1",
         preferredModel: String = "",
         preferredFallbackModel: String = "",
-        instructionExecutionGuardEnabled: Bool = true
+        instructionExecutionGuardEnabled: Bool = true,
+        sendRequest: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await LLMAPITransport.data(for: $0) }
     ) {
+        self.sendRequest = sendRequest
         self.apiKey = apiKey
         self.baseURL = baseURL
         self.preferredModel = preferredModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -264,12 +267,13 @@ Behavior:
         voiceCommand: String,
         context: AppContext,
         customVocabulary: String,
-        outputLanguage: String = ""
+        outputLanguage: String = "",
+        writingRequest: VoiceWritingRequest? = nil
     ) async throws -> PostProcessingResult {
         let vocabularyTerms = mergedVocabularyTerms(rawVocabulary: customVocabulary)
         let trimmedSelectedText = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedVoiceCommand = voiceCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedSelectedText.isEmpty else {
+        guard writingRequest?.action == .draftReply || !trimmedSelectedText.isEmpty else {
             throw PostProcessingError.invalidInput("Selected text must not be empty")
         }
         guard !trimmedVoiceCommand.isEmpty else {
@@ -289,7 +293,8 @@ Behavior:
                     contextSummary: context.contextSummary,
                     customVocabulary: vocabularyTerms,
                     outputLanguage: outputLanguage,
-                    deadline: deadline
+                    deadline: deadline,
+                    writingRequest: writingRequest
                 )
             }
 
@@ -406,7 +411,8 @@ Behavior:
         contextSummary: String,
         customVocabulary: [String],
         outputLanguage: String = "",
-        deadline: Date
+        deadline: Date,
+        writingRequest: VoiceWritingRequest? = nil
     ) async throws -> PostProcessingResult {
         var primaryModel = resolvedPrimaryModel()
         let retryModel = resolvedRetryModel(for: primaryModel)
@@ -414,6 +420,7 @@ Behavior:
         // Circuit breaker: pick a model that isn't cooling down. If BOTH are cooling, skip the
         // transform and return the selection unchanged rather than send a doomed request.
         guard let availableModel = await LLMCooldownManager.shared.effectivePrimary(primaryModel, fallback: retryModel) else {
+            if writingRequest != nil { throw PostProcessingError.emptyOutput }
             return PostProcessingResult(transcript: selectedText, prompt: "")
         }
         primaryModel = availableModel
@@ -426,7 +433,8 @@ Behavior:
                 model: primaryModel,
                 customVocabulary: customVocabulary,
                 outputLanguage: outputLanguage,
-                deadline: deadline
+                deadline: deadline,
+                writingRequest: writingRequest
             )
         } catch let error as PostProcessingError {
             // Unified fallback policy: decide whether to retry on the other model.
@@ -459,7 +467,8 @@ Behavior:
                 model: retryModel,
                 customVocabulary: customVocabulary,
                 outputLanguage: outputLanguage,
-                deadline: deadline
+                deadline: deadline,
+                writingRequest: writingRequest
             )
         }
     }
@@ -609,7 +618,7 @@ Model: \(model)
 
         request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
 
-        let (data, response) = try await LLMAPITransport.data(for: request)
+        let (data, response) = try await sendRequest(request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw PostProcessingError.invalidResponse("No HTTP response")
         }
@@ -666,7 +675,8 @@ Model: \(model)
         model: String,
         customVocabulary: [String],
         outputLanguage: String = "",
-        deadline: Date
+        deadline: Date,
+        writingRequest: VoiceWritingRequest? = nil
     ) async throws -> PostProcessingResult {
         var request = try makeChatRequest(deadline: deadline)
 
@@ -693,7 +703,7 @@ Use these spellings exactly in the output when relevant:
             systemPrompt += "\n\n" + vocabularyPrompt
         }
 
-        let userMessage = """
+        var userMessage = """
 Transform SELECTED_TEXT according to VOICE_COMMAND and return only the replacement text.
 
 CONTEXT: "\(contextSummary)"
@@ -702,6 +712,11 @@ VOICE_COMMAND: "\(voiceCommand)"
 
 SELECTED_TEXT: "\(selectedText)"
 """
+
+        if let writingRequest {
+            systemPrompt = writingRequest.systemPrompt
+            userMessage = try writingRequest.userMessage(vocabulary: customVocabulary)
+        }
 
         let promptForDisplay = """
 Model: \(model)
@@ -734,10 +749,15 @@ Model: \(model)
             model: model,
             inputText: selectedText + " " + voiceCommand
         )
+        if writingRequest != nil, let budget = payload["max_completion_tokens"] as? Int {
+            // A short intention can produce a full reply; cleanup's proportional
+            // budget would otherwise truncate it. Keep ordinary dictation intact.
+            payload["max_completion_tokens"] = min(config.maxCompletionTokens ?? postProcessingMaxCompletionTokens, max(1024, budget))
+        }
 
         request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
 
-        let (data, response) = try await LLMAPITransport.data(for: request)
+        let (data, response) = try await sendRequest(request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw PostProcessingError.invalidResponse("No HTTP response")
         }
@@ -762,6 +782,9 @@ Model: \(model)
             throw PostProcessingError.invalidResponse("Missing choices[0].message.content")
         }
 
+        if writingRequest != nil, let reason = firstChoice["finish_reason"] as? String, reason != "stop" {
+            throw PostProcessingError.invalidResponse("Writing output was incomplete")
+        }
         var content = rawContent
         if config.shouldStripThinkTags {
             content = ModelConfiguration.stripThinkTags(content)
@@ -772,9 +795,12 @@ Model: \(model)
         }
 
         let sanitizedTranscript = TranscriptOutputSanitizer.commandModeTranscript(content)
+        guard writingRequest == nil || !sanitizedTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PostProcessingError.emptyOutput
+        }
         return PostProcessingResult(
             transcript: sanitizedTranscript,
-            prompt: promptForDisplay
+            prompt: writingRequest == nil ? promptForDisplay : ""
         )
     }
 
@@ -892,7 +918,7 @@ Model: \(model)
 
         request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
 
-        let (data, response) = try await LLMAPITransport.data(for: request)
+        let (data, response) = try await sendRequest(request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw PostProcessingError.invalidResponse("No HTTP response")
         }

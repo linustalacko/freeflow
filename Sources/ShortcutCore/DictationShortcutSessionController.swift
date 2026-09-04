@@ -28,7 +28,7 @@ final class DictationShortcutSessionController {
                 return .start(.hold)
             case .holdDeactivated, .toggleDeactivated:
                 return nil
-            case .copyAgainTriggered:
+            case .copyAgainTriggered, .writingTriggered:
                 return nil
             }
         }
@@ -47,7 +47,7 @@ final class DictationShortcutSessionController {
                 return .stop
             case .holdActivated, .toggleDeactivated:
                 return nil
-            case .copyAgainTriggered:
+            case .copyAgainTriggered, .writingTriggered:
                 return nil
             }
 
@@ -62,7 +62,7 @@ final class DictationShortcutSessionController {
                 return .stop
             case .holdActivated, .holdDeactivated:
                 return nil
-            case .copyAgainTriggered:
+            case .copyAgainTriggered, .writingTriggered:
                 return nil
             }
         }
