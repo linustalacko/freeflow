@@ -2654,7 +2654,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private enum TranscriptProcessingOutcome {
         case skippedEmptyRawTranscript
         case voiceMacro(command: String)
-        case shortUtterancePastedRaw
         case alreadyCleanPastedRaw
         case postProcessingSucceeded
         case postProcessingFailedFallback
@@ -2670,8 +2669,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return "Skipped macros and post-processing for empty raw transcript"
             case .voiceMacro(let command):
                 return "Voice macro used: \(command)"
-            case .shortUtterancePastedRaw:
-                return "Short utterance, pasted instantly without post-processing"
             case .alreadyCleanPastedRaw:
                 return "Transcript already clean, pasted instantly without post-processing"
             case .postProcessingSucceeded:
@@ -2761,17 +2758,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
         }
 
-        // Fast path: very short utterances ("yes", "sounds good", "thanks") gain
-        // nothing from LLM cleanup — skip it and paste instantly instead of
-        // paying a 0.5–3s round trip. Whisper already punctuates/capitalizes.
+        // Even one-word dictations must honor translation, vocabulary and
+        // custom instructions. Use the same eligibility check at every length.
         let words = trimmedRawTranscript.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
-        if words.count <= 3 {
-            let flattened = words.joined(separator: " ")
-            os_log(.info, log: recordingLog, "Short utterance fast path (%d words), skipping post-processing", words.count)
-            return (flattened, .shortUtterancePastedRaw, "")
-        }
-
-        // Fast path 2: the STT output is already a clean short sentence (no
+        // Fast path: the STT output is already a clean short sentence (no
         // fillers, self-corrections, spoken punctuation, mis-cased vocabulary)
         // — the model would hand it back unchanged, so don't pay the round trip.
         // Tune/disable with `defaults write … clean_transcript_fast_path_max_words N`.
@@ -2782,11 +2772,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
             appName: context.appName,
             windowTitle: context.windowTitle
         )
-        if customSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           let alreadyClean = TranscriptFastPath.cleanedIfAlreadyClean(
+        if let alreadyClean = TranscriptFastPath.cleanedIfAlreadyClean(
                trimmedRawTranscript, maxWords: fastPathMaxWords, vocabulary: customVocabulary,
-               profile: profile
+               profile: profile, customSystemPrompt: customSystemPrompt, outputLanguage: outputLanguage
            ) {
             os_log(.info, log: recordingLog, "Already-clean fast path (%d words), skipping post-processing", words.count)
             return (alreadyClean, .alreadyCleanPastedRaw, "")

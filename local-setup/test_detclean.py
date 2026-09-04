@@ -19,6 +19,11 @@ from detclean import det_clean, finalize_text, profile_for, profile_from_system_
 
 # (target, input) -> Swift output; None means "bail to the model".
 GOLDEN = [
+    ("document", "the gap is 5 mm wide", "The gap is 5 mm wide."),
+    ("document", "take it to the ER", "Take it to the ER."),
+    ("chat", "mhm that could work", "Mhm that could work"),
+    ("chat", "hmm that seems unlikely", "Hmm that seems unlikely"),
+    ("chat", "5 mm", "5 mm"),
     ("chat", "bullet point ship the release bullet point update the docs",
      "- Ship the release\n- Update the docs"),
     ("email", "bullet point one thing bullet point another thing",

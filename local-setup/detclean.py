@@ -15,7 +15,8 @@ the app's own fast path would have.
 """
 import re
 
-FILLERS = {"um", "uh", "uhm", "umm", "uhh", "erm", "er", "ah", "eh", "hmm", "hm", "mhm", "mm"}
+# Preserve units, acronyms and meaningful acknowledgements (Swift parity).
+FILLERS = {"um", "uh", "uhm", "umm", "uhh", "erm"}
 # List/break/quote words are absent on purpose: spoken_format() resolves those
 # when unambiguous and reports ambiguity otherwise (same contract as the Swift).
 BAIL_PHRASES = [

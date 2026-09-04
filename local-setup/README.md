@@ -1,5 +1,8 @@
 # FreeFlow — fully local / hybrid speech-to-text setup
 
+For synthetic latency checks and the manual microphone/paste checklist, see
+[Pipeline validation](PIPELINE_VALIDATION.md).
+
 This fork adds a **100% local** (or fast hybrid) speech-to-text + cleanup pipeline for
 FreeFlow, so you don't need to pay for a hosted transcription API.
 

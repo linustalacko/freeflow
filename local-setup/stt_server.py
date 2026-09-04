@@ -41,11 +41,10 @@ How the streaming path stays fast (and accurate)
   touched every STT_HEARTBEAT_S while idle so they cannot be paged out either.
 
 Client contract subtleties (see RealtimeTranscriptionService.swift):
-* The app appends every `completed` transcript to its final text (joined by a
-  single space), and resolves the await on the FIRST `completed` it receives
-  after it sent `commit`. So once we have received `commit` we must emit exactly
-  ONE `completed`, carrying everything not yet emitted. Partial results that
-  finish after the commit are discarded — their words are covered by the tail.
+* Settled chunks have distinct item IDs. The final completion matches the ID
+  in `input_audio_buffer.committed`, so an in-flight chunk cannot resolve the
+  client's final await. After commit exactly one completion carries everything
+  not yet emitted. Late partial decodes are discarded, covered by that tail.
 
 Config (env):
   STT_MODEL            default mlx-community/parakeet-tdt-0.6b-v2 (English; -v3 = multilingual, see note)
@@ -147,19 +146,28 @@ class StreamResampler:
     (or flush) so both edges of every emitted sample had real neighbours."""
 
     def __init__(self, sr_in, sr_out=TARGET_SR, overlap=240):
+        from math import gcd
+        if sr_in <= 0 or sr_out <= 0:
+            raise ValueError("sample rates must be positive")
         self.sr_in, self.sr_out = sr_in, sr_out
-        self.overlap = overlap
+        self.quantum = sr_in // gcd(sr_in, sr_out)
+        # Keep the polyphase filter on the same sample grid across arbitrary
+        # microphone packet sizes. Both the emitted input and left context must
+        # span whole input quanta; rounding each packet independently drifts.
+        support = int(np.ceil(10 * max(sr_in, sr_out) / sr_out))
+        self.overlap = int(np.ceil(max(overlap, support) / self.quantum)) * self.quantum
         self.pending = np.zeros(0, dtype=np.float32)   # input not yet emitted
         self.context = np.zeros(0, dtype=np.float32)   # already-emitted input kept as left context
 
     def _out_len(self, n_in):
-        return int(round(n_in * self.sr_out / self.sr_in))
+        return (n_in * self.sr_out + self.sr_in - 1) // self.sr_in
 
     def feed(self, x, final=False):
         if self.sr_in == self.sr_out:
             return x
         self.pending = np.concatenate([self.pending, x])
-        emit_n = len(self.pending) if final else len(self.pending) - self.overlap
+        emit_n = len(self.pending) if final else (
+            (len(self.pending) - self.overlap) // self.quantum * self.quantum)
         if emit_n <= 0:
             return np.zeros(0, dtype=np.float32)
         block = np.concatenate([self.context, self.pending])
@@ -169,6 +177,48 @@ class StreamResampler:
         emitted, self.pending = self.pending[:emit_n], self.pending[emit_n:]
         self.context = np.concatenate([self.context, emitted])[-self.overlap:]
         return out.astype(np.float32)
+
+
+class AudioWindowBuffer:
+    """Amortized append with absolute sample indices and immutable snapshots.
+
+    Settled audio older than the model's left context is discarded. Growing or
+    compacting storage cannot change a window already decoding on the GPU.
+    """
+
+    def __init__(self):
+        self.storage = np.empty(TARGET_SR * 16, dtype=np.float32)
+        self.head = self.tail = self.start = 0
+
+    @property
+    def end(self):
+        return self.start + self.tail - self.head
+
+    def append(self, samples):
+        count = self.tail - self.head
+        if self.tail + len(samples) > len(self.storage):
+            capacity = max(len(self.storage), 2 * (count + len(samples)))
+            storage = np.empty(capacity, dtype=np.float32)
+            storage[:count] = self.storage[self.head:self.tail]
+            self.storage = storage
+            self.head, self.tail = 0, count
+        self.storage[self.tail:self.tail + len(samples)] = samples
+        self.tail += len(samples)
+
+    def snapshot(self, start):
+        if not self.start <= start <= self.end:
+            raise ValueError("audio window is outside retained samples")
+        return self.storage[self.head + start - self.start:self.tail].copy()
+
+    def discard_before(self, start):
+        start = min(max(start, self.start), self.end)
+        self.head += start - self.start
+        self.start = start
+        count = self.tail - self.head
+        if len(self.storage) > 4 * max(count, TARGET_SR * 16):
+            storage = np.empty(max(TARGET_SR * 16, count * 2), dtype=np.float32)
+            storage[:count] = self.storage[self.head:self.tail]
+            self.storage, self.head, self.tail = storage, 0, count
 
 
 def decode_wav(data: bytes):
@@ -315,7 +365,7 @@ class RealtimeSession:
         self.loop = asyncio.get_running_loop()
         self.rate = 24000
         self.resampler = StreamResampler(self.rate)
-        self.buf = np.zeros(0, dtype=np.float32)   # the whole session, 16 kHz
+        self.buf = AudioWindowBuffer()
         self.settled_samples = 0                    # audio before this index has been emitted
         self.settled_chars = 0
         self.settled_chunks = 0
@@ -343,21 +393,23 @@ class RealtimeSession:
 
     # ---- audio in ------------------------------------------------------------
     def on_append(self, ev):
+        if self.committed:
+            return
         x = self.resampler.feed(pcm16_to_float(base64.b64decode(ev.get("audio", ""))))
-        self.buf = np.concatenate([self.buf, x])
+        self.buf.append(x)
         self.audio_since_partial += len(x) / TARGET_SR
         if (not self.committed and not self.partial_inflight
                 and self.audio_since_partial >= PARTIAL_EVERY_S):
             self.audio_since_partial = 0.0
             # Nothing new to hear (the user is thinking): skip the window.
-            recent = self.buf[-int(PARTIAL_EVERY_S * TARGET_SR):]
+            recent = self.buf.snapshot(max(self.buf.start, self.buf.end - int(PARTIAL_EVERY_S * TARGET_SR)))
             if len(recent) and float(np.max(np.abs(recent))) < 1e-4:
                 return
             self._schedule_partial()
 
     def _window(self):
         start = max(0, self.settled_samples - int(LEFT_CONTEXT_S * TARGET_SR))
-        return start, len(self.buf), self.buf[start:]
+        return start, self.buf.end, self.buf.snapshot(start)
 
     def _schedule_partial(self):
         self.partial_inflight = True
@@ -398,27 +450,30 @@ class RealtimeSession:
         gap_end = rest[0].start if rest else window_end
         cut_time = min(settled[-1].end + (gap_end - settled[-1].end) / 2.0, settled[-1].end + 0.5)
         self.settled_samples = max(self.settled_samples, int(cut_time * TARGET_SR))
+        self.buf.discard_before(max(0, self.settled_samples - int(LEFT_CONTEXT_S * TARGET_SR)))
         self.settled_words = (self.settled_words + settled)[-8:]
         self.prev_hyp = rest
         text = words_text(settled)
         self.settled_chars += len(text)
         self.settled_chunks += 1
-        log.info("settled: +%d chars (%d words, settled to %.1fs of %.1fs, window %.1fs → %.0fms) %r",
+        log.info("settled: +%d chars (%d words, settled to %.1fs of %.1fs, window %.1fs → %.0fms)",
                  len(text), n, cut_time, window_end, (end_idx - start_idx) / TARGET_SR,
-                 (time.monotonic() - t0) * 1000, text if len(text) <= 48 else text[:22] + "…" + text[-22:])
+                 (time.monotonic() - t0) * 1000)
         if text:
             asyncio.ensure_future(self.send({
                 "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": self.item_id, "transcript": text}))
+                "item_id": self.item_id + "_part_%d" % self.settled_chunks, "transcript": text}))
             asyncio.ensure_future(precache(self.app, text))
 
     # ---- commit --------------------------------------------------------------
     def on_commit(self):
+        if self.committed:
+            return
         self.committed = True
         self.t_commit = time.monotonic()
         held = self.resampler.feed(np.zeros(0, dtype=np.float32), final=True)
         if len(held):
-            self.buf = np.concatenate([self.buf, held])
+            self.buf.append(held)
         start, end, audio = self._window()
         fut = self.loop.run_in_executor(self.app["executor"], self._tokens_safe, audio)
         fut.add_done_callback(lambda f: self.loop.call_soon_threadsafe(self._on_final, f, start, end))
@@ -520,8 +575,11 @@ async def handle_realtime(request):
             elif t == "input_audio_buffer.append":
                 sess.on_append(ev)
             elif t == "input_audio_buffer.commit":
-                await sess.send({"type": "input_audio_buffer.committed", "item_id": sess.item_id})
-                sess.on_commit()
+                if not sess.committed:
+                    # Freeze settling before the first await: sending the ack
+                    # can yield while a partial decode finishes.
+                    sess.on_commit()
+                    await sess.send({"type": "input_audio_buffer.committed", "item_id": sess.item_id})
     finally:
         state.sessions -= 1
     log.info("realtime: session closed")
