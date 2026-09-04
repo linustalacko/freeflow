@@ -101,6 +101,12 @@ final class InlineEditCaptureService {
         pending = nil
     }
 
+    /// Generated rewrites are not manual corrections or training examples.
+    func discardPending() {
+        stopPolling()
+        pending = nil
+    }
+
     // MARK: - Polling
 
     private func startPolling() {

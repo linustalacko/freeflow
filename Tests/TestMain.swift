@@ -2,7 +2,7 @@ import Foundation
 
 @main
 struct FreeFlowTests {
-    static func main() {
+    static func main() async {
         AppContextServiceTests.run()
         DictationProfileTests.run()
         ModelConfigurationTests.run()
@@ -14,6 +14,9 @@ struct FreeFlowTests {
         TranscriptFastPathTests.run()
         TranscriptTextCoreTests.run()
         VocabularyLearnerTests.run()
+        VoiceWritingTests.run()
+        VoiceWritingTargetTests.run()
+        await VoiceWritingRequestTests.run()
         print("FreeFlowTests passed")
     }
 }

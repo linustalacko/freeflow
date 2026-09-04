@@ -356,6 +356,23 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    @Published var editLastShortcut: ShortcutBinding {
+        didSet {
+            persistShortcut(editLastShortcut, key: "edit_last_shortcut")
+            restartHotkeyMonitoring()
+        }
+    }
+    @Published var draftReplyShortcut: ShortcutBinding {
+        didSet {
+            persistShortcut(draftReplyShortcut, key: "draft_reply_shortcut")
+            restartHotkeyMonitoring()
+        }
+    }
+    private let writingTargets = VoiceWritingTargetService()
+    private var writingSession: VoiceWritingTargetService.Session?
+    private var inlineInsertionGeneration = UUID()
+    private var pendingPasteCount = 0
+
     @Published var copyAgainShortcut: ShortcutBinding {
         didSet {
             persistShortcut(copyAgainShortcut, key: copyAgainShortcutStorageKey)
@@ -755,6 +772,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.holdShortcut = shortcuts.hold
         self.toggleShortcut = shortcuts.toggle
         self.copyAgainShortcut = shortcuts.copyAgain
+        self.editLastShortcut = Self.loadShortcut(forKey: "edit_last_shortcut").binding ?? .disabled
+        self.draftReplyShortcut = Self.loadShortcut(forKey: "draft_reply_shortcut").binding ?? .disabled
         self.savedHoldCustomShortcut = savedHoldCustomShortcut.binding
         self.savedToggleCustomShortcut = savedToggleCustomShortcut.binding
         self.savedCopyAgainCustomShortcut = savedCopyAgainCustomShortcut.binding
@@ -1596,7 +1615,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     var usesFnShortcut: Bool {
-        holdShortcut.usesFnKey || toggleShortcut.usesFnKey || copyAgainShortcut.usesFnKey
+        activeShortcutConfiguration.allBindings.contains { $0.usesFnKey }
     }
 
     var hasEnabledHoldShortcut: Bool {
@@ -1634,6 +1653,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return savedHoldCustomShortcut
         case .toggle:
             return savedToggleCustomShortcut
+        case .editLast: return editLastShortcut.isCustom ? editLastShortcut : nil
+        case .draftReply: return draftReplyShortcut.isCustom ? draftReplyShortcut : nil
         case .copyAgain:
             return savedCopyAgainCustomShortcut
         }
@@ -1642,6 +1663,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     var commandModeManualModifierValidationMessage: String? {
         guard isCommandModeEnabled, commandModeStyle == .manual else { return nil }
         return commandModeManualModifierCollisionMessage(for: commandModeManualModifier)
+    }
+
+    var voiceWritingShortcutValidationMessage: String? {
+        let config = activeShortcutConfiguration
+        if config.editLast != editLastShortcut || config.draftReply != draftReplyShortcut {
+            return "A voice-writing shortcut overlaps another shortcut or the Edit Mode modifier. Choose a distinct combination to enable it."
+        }
+        return nil
     }
 
     @discardableResult
@@ -1676,6 +1705,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
     func setShortcut(_ binding: ShortcutBinding, for role: ShortcutRole) -> String? {
         let binding = binding.normalizedForStorageMigration()
 
+        let bindings: [(ShortcutRole, ShortcutBinding)] = [
+            (.hold, holdShortcut), (.toggle, toggleShortcut), (.copyAgain, copyAgainShortcut),
+            (.editLast, editLastShortcut), (.draftReply, draftReplyShortcut)
+        ]
+        for (otherRole, other) in bindings where otherRole != role {
+            if (role == .editLast || role == .draftReply || otherRole == .editLast || otherRole == .draftReply),
+               binding.overlapsWritingShortcut(other) {
+                return "Choose a shortcut that does not overlap with \(otherRole.title)."
+            }
+        }
+
         if role == .hold || role == .toggle {
             let otherDictationBinding = role == .hold ? toggleShortcut : holdShortcut
             guard !binding.conflicts(with: otherDictationBinding) else {
@@ -1700,6 +1740,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
 
         switch role {
+        case .editLast: editLastShortcut = binding
+        case .draftReply: draftReplyShortcut = binding
         case .hold:
             if binding.isCustom {
                 savedHoldCustomShortcut = binding
@@ -1818,6 +1860,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             hold: holdShortcut,
             toggle: toggleShortcut,
             copyAgain: copyAgainShortcut,
+            editLast: editLastShortcut,
+            draftReply: draftReplyShortcut,
             permittedAdditionalExactMatchModifiers: permittedAdditionalExactMatchModifiers
         )
     }
@@ -1838,6 +1882,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     }
 
     private func handleShortcutEvent(_ event: ShortcutEvent) {
+        if case .writingTriggered(let action) = event {
+            toggleVoiceWriting(action)
+            return
+        }
+        if writingSession != nil { return }
         if event == .copyAgainTriggered {
             copyLastTranscriptToPasteboard()
             return
@@ -1890,8 +1939,107 @@ final class AppState: ObservableObject, @unchecked Sendable {
     func copyLastTranscriptToPasteboard() {
         guard !lastTranscript.isEmpty else { return }
         let pendingClipboardRestore = writeTranscriptToPasteboard(lastTranscript)
-        pasteAtCursorWhenShortcutReleased { [weak self] in
+        pasteAtCursorWhenShortcutReleased(tracking: WritingTextAnchor.pasteText(lastTranscript)) { [weak self] in
             self?.restoreClipboardIfNeeded(pendingClipboardRestore)
+        }
+    }
+
+    func toggleVoiceWriting(_ action: VoiceWritingAction) {
+        if isRecording {
+            if writingSession?.action == action { stopAndTranscribe() }
+            return
+        }
+        guard !isTranscribing, pendingShortcutStartMode == nil, pendingPasteCount == 0 else { return }
+        // Permission setup remains deliberate; these actions never prompt for
+        // screen capture and do not start recording while a system prompt is up.
+        guard AXIsProcessTrusted(), AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            errorMessage = "Enable Accessibility and Microphone access in FreeFlow's setup before using voice writing."
+            statusText = "Permissions needed"
+            return
+        }
+        do {
+            let session = try writingTargets.prepare(action)
+            inlineInsertionGeneration = UUID()
+            inlineEditCapture.discardPending()
+            cancelPendingShortcutStart()
+            contextCaptureTask?.cancel()
+            contextCaptureTask = nil
+            capturedContext = nil
+            writingSession = session
+            currentSessionIntent = .dictation
+            activeRecordingTriggerMode = .toggle
+            shortcutSessionController.beginManual(mode: .toggle)
+            overlayManager.setRecordingTriggerMode(.toggle, animated: false)
+            applyAudioInterruptionIfNeeded()
+            beginRecording(triggerMode: .toggle)
+        } catch {
+            showVoiceWritingError(error)
+        }
+    }
+
+    private func showVoiceWritingError(_ error: Error, resultAvailable: Bool = false) {
+        // Provider errors may echo request content. Only our fixed local errors
+        // are shown; never persist or display a provider's response body.
+        var message = (error as? VoiceWritingError)?.errorDescription
+            ?? "Voice writing could not finish. Nothing was replaced. Please try again."
+        if resultAvailable { message += " Your result is available from Paste Again." }
+        errorMessage = message
+        statusText = "Voice writing stopped"
+        overlayManager.showError(message)
+    }
+
+    private func finishVoiceWriting(
+        _ session: VoiceWritingTargetService.Session,
+        instruction: String,
+        service: PostProcessingService
+    ) async throws {
+        let replacement: String
+        if session.action == .editLast && WritingTextAnchor.isUndo(instruction) {
+            guard let previous = session.anchor.undoText else { throw VoiceWritingError.noUndo }
+            replacement = previous
+        } else {
+            let request = VoiceWritingRequest(
+                action: session.action, instruction: instruction, sourceText: session.anchor.text,
+                thread: session.thread, outputLanguage: outputLanguage
+            )
+            let emptyContext = AppContext(
+                appName: nil, bundleIdentifier: nil, windowTitle: nil, selectedText: nil,
+                currentActivity: "", contextSystemPrompt: nil, contextPrompt: nil,
+                screenshotDataURL: nil, screenshotMimeType: nil, screenshotError: nil
+            )
+            let result = try await service.commandTransform(
+                selectedText: session.anchor.text, voiceCommand: instruction,
+                context: emptyContext, customVocabulary: customVocabulary,
+                outputLanguage: outputLanguage, writingRequest: request
+            )
+            replacement = WritingTextAnchor.pasteText(result.transcript.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        try Task.checkCancellation()
+        await MainActor.run {
+            guard self.isTranscribing, self.writingSession?.id == session.id else { return }
+            // Keep the session cancellable until the exact destination has been
+            // validated and the paste has actually been dispatched.
+            self.performAfterShortcutReleased { [weak self] in
+                guard let self, self.isTranscribing, self.writingSession?.id == session.id else { return }
+                self.lastTranscript = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+                do {
+                    guard !self.hotkeyManager.hasPressedShortcutInputs else { throw VoiceWritingError.changedTarget }
+                    try self.writingTargets.selectReplacement(for: session, text: replacement)
+                    let restore = self.writeTranscriptToPasteboard(replacement, appendTrailingSpace: false)
+                    self.pasteAtCursor()
+                    self.restoreClipboardIfNeeded(restore)
+                    self.statusText = session.action == .draftReply ? "Reply drafted — review in Gmail" : "Last dictation updated"
+                    self.overlayManager.dismiss()
+                } catch {
+                    self.showVoiceWritingError(error, resultAvailable: !self.lastTranscript.isEmpty)
+                }
+                self.writingSession = nil
+                self.transcriptionTask = nil
+                self.isTranscribing = false
+                self.audioRecorder.cleanup()
+                self.endCriticalDictationActivity()
+                self.refreshAvailableMicrophonesIfNeeded()
+            }
         }
     }
 
@@ -1969,6 +2117,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         contextCaptureTask = nil
         capturedContext = nil
         currentSessionIntent = .dictation
+        writingSession = nil
         isRecording = false
         errorMessage = nil
         debugStatusMessage = "Cancelled"
@@ -1995,6 +2144,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         shortcutSessionController.reset()
         activeRecordingTriggerMode = nil
         currentSessionIntent = .dictation
+        writingSession = nil
         isRecording = false
         isTranscribing = false
         errorMessage = nil
@@ -2373,7 +2523,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             self.clearPendingOverlayDismissToken()
             self.overlayManager.showInitializing(
                 mode: self.activeRecordingTriggerMode ?? triggerMode,
-                isCommandMode: self.currentSessionIntent.isCommandMode
+                isCommandMode: self.currentSessionIntent.isCommandMode || self.writingSession != nil
             )
         }
         initTimer.resume()
@@ -2385,17 +2535,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 guard let self else { return }
                 self.cancelRecordingInitializationTimer()
                 os_log(.info, log: recordingLog, "first real audio — transitioning to waveform")
-                self.statusText = "Recording..."
+                self.statusText = self.writingSession?.action.title ?? "Recording..."
                 self.clearPendingOverlayDismissToken()
                 if overlayShown {
                     self.overlayManager.transitionToRecording(
                         mode: self.activeRecordingTriggerMode ?? triggerMode,
-                        isCommandMode: self.currentSessionIntent.isCommandMode
+                        isCommandMode: self.currentSessionIntent.isCommandMode || self.writingSession != nil
                     )
                 } else {
                     self.overlayManager.showRecording(
                         mode: self.activeRecordingTriggerMode ?? triggerMode,
-                        isCommandMode: self.currentSessionIntent.isCommandMode
+                        isCommandMode: self.currentSessionIntent.isCommandMode || self.writingSession != nil
                     )
                 }
                 overlayShown = true
@@ -2421,7 +2571,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 os_log(.info, log: recordingLog, "audioRecorder.startRecording() done: %.3fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
                 DispatchQueue.main.async {
                     guard self.isRecording, self.activeRecordingTriggerMode != nil else { return }
-                    self.startContextCapture()
+                    if self.writingSession == nil { self.startContextCapture() }
                     self.audioLevelCancellable = self.audioRecorder.$audioLevel
                         .receive(on: DispatchQueue.main)
                         .sink { [weak self] level in
@@ -2460,6 +2610,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
         activeRecordingTriggerMode = nil
         currentSessionIntent = .dictation
+        writingSession = nil
         shortcutSessionController.reset()
         endCriticalDictationActivity()
         errorMessage = formattedRecordingStartError(error)
@@ -2832,6 +2983,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         cancelRecordingInitializationTimer()
         shortcutSessionController.reset()
         activeRecordingTriggerMode = nil
+        let voiceWritingSession = writingSession
         let sessionIntent = currentSessionIntent
         currentSessionIntent = .dictation
         audioRecorder.onRecordingReady = nil
@@ -2859,10 +3011,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
         overlayManager.showTranscribing()
         audioRecorder.stopRecording { [weak self] fileURL in
             guard let self else { return }
+            if let voiceWritingSession, self.writingSession?.id != voiceWritingSession.id {
+                // Cancellation may be followed immediately by another recording.
+                // The old callback owns only its own unique temporary audio file.
+                if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+                return
+            }
             guard let fileURL else {
                 self.isTranscribing = false
                 self.audioRecorder.cleanup()
                 self.endCriticalDictationActivity()
+                self.writingSession = nil
                 self.errorMessage = "No audio recorded"
                 self.statusText = "Error"
                 self.overlayManager.dismiss()
@@ -2877,7 +3036,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return
             }
 
-            let savedAudioFile = Self.saveAudioFile(from: fileURL)
+            let savedAudioFile = voiceWritingSession == nil ? Self.saveAudioFile(from: fileURL) : nil
             let transcriptionFileURL = savedAudioFile?.fileURL ?? fileURL
             self.transcribingAudioFileName = savedAudioFile?.fileName
             self.statusText = "Transcribing..."
@@ -2918,6 +3077,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         fileURL: transcriptionFileURL
                     )
                     let rawTranscript = try await transcript
+                    if let voiceWritingSession {
+                        try await self.finishVoiceWriting(voiceWritingSession, instruction: rawTranscript, service: postProcessingService)
+                        return
+                    }
                     let tTranscript = CFAbsoluteTimeGetCurrent()
                     let parsedTranscript = Self.parseTranscriptCommands(
                         from: rawTranscript,
@@ -3035,7 +3198,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             }
 
                             let pendingClipboardRestore = self.writeTranscriptToPasteboard(trimmedFinalTranscript)
-                            self.pasteAtCursorWhenShortcutReleased {
+                            let insertionGeneration = self.inlineInsertionGeneration
+                            self.pasteAtCursorWhenShortcutReleased(tracking: WritingTextAnchor.pasteText(trimmedFinalTranscript)) {
                                 if shouldPressEnterAfterPaste {
                                     self.pressEnterAfterPaste {
                                         self.restoreClipboardIfNeeded(pendingClipboardRestore)
@@ -3046,6 +3210,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
                                 // After our text lands, snapshot the field so we can
                                 // passively capture any inline edits you make to it.
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                    guard self.inlineInsertionGeneration == insertionGeneration,
+                                          self.writingSession == nil else { return }
                                     self.inlineEditCapture.noteInsertion(
                                         itemID: recordedItemID,
                                         inserted: trimmedFinalTranscript
@@ -3061,10 +3227,31 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     }
                 } catch is CancellationError {
                     await MainActor.run {
+                        if let voiceWritingSession {
+                            guard self.writingSession?.id == voiceWritingSession.id else { return }
+                            self.writingSession = nil
+                            self.isTranscribing = false
+                            self.audioRecorder.cleanup()
+                            self.overlayManager.dismiss()
+                            self.statusText = "Cancelled"
+                        }
                         self.transcriptionTask = nil
                         self.endCriticalDictationActivity()
                     }
                 } catch {
+                    if let voiceWritingSession {
+                        await MainActor.run {
+                            guard self.writingSession?.id == voiceWritingSession.id else { return }
+                            self.writingSession = nil
+                            self.transcriptionTask = nil
+                            self.isTranscribing = false
+                            self.audioRecorder.cleanup()
+                            self.endCriticalDictationActivity()
+                            self.showVoiceWritingError(error)
+                            self.refreshAvailableMicrophonesIfNeeded()
+                        }
+                        return
+                    }
                     let resolvedContext: AppContext
                     if let sessionContext {
                         resolvedContext = sessionContext
@@ -3557,18 +3744,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// types for clipboard managers, and saving the clipboard state for later restoration.
     /// - Parameter transcript: The text to be pasted.
     /// - Returns: A `PendingClipboardRestore` object if clipboard preservation is enabled, otherwise nil.
-    private func writeTranscriptToPasteboard(_ transcript: String) -> PendingClipboardRestore? {
+    private func writeTranscriptToPasteboard(_ transcript: String, appendTrailingSpace: Bool = true) -> PendingClipboardRestore? {
         let pasteboard = NSPasteboard.general
         let snapshot = preserveClipboard ? PreservedPasteboardSnapshot(pasteboard: pasteboard) : nil
 
-        // Append a space when ending with sentence-ending punctuation so the
-        // next dictation does not jam against the prior period.
-        let textToWrite: String
-        if let last = transcript.last, ".!?".contains(last) {
-            textToWrite = transcript + " "
-        } else {
-            textToWrite = transcript
-        }
+        let textToWrite = appendTrailingSpace ? WritingTextAnchor.pasteText(transcript) : transcript
 
         if keepDictationInClipboardHistory {
             // Plain write so clipboard managers record the dictation in history.
@@ -3647,9 +3827,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func pasteAtCursorWhenShortcutReleased(completion: (() -> Void)? = nil) {
+    private func pasteAtCursorWhenShortcutReleased(tracking text: String? = nil, completion: (() -> Void)? = nil) {
+        pendingPasteCount += 1
         performAfterShortcutReleased { [weak self] in
-            self?.pasteAtCursor()
+            guard let self else { return }
+            defer { self.pendingPasteCount -= 1 }
+            if let text {
+                self.writingTargets.rememberInsertion(text, into: self.writingTargets.snapshot())
+            }
+            self.pasteAtCursor()
             completion?()
         }
     }

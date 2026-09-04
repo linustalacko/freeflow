@@ -118,6 +118,11 @@ struct MenuBarView: View {
             }
             .disabled(appState.isTranscribing)
 
+            Button("Edit Last Dictation") { appState.toggleVoiceWriting(.editLast) }
+                .disabled(appState.isRecording || appState.isTranscribing)
+            Button("Draft Gmail Reply") { appState.toggleVoiceWriting(.draftReply) }
+                .disabled(appState.isRecording || appState.isTranscribing)
+
             if let hotkeyError = appState.hotkeyMonitoringErrorMessage {
                 Divider()
                 Text(hotkeyError)

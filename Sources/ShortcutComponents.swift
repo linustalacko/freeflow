@@ -11,6 +11,8 @@ struct DictationShortcutEditor: View {
     @State private var holdValidationMessage: String?
     @State private var toggleValidationMessage: String?
     @State private var copyAgainValidationMessage: String?
+    @State private var editLastValidationMessage: String?
+    @State private var draftReplyValidationMessage: String?
 
     init(showsIntroText: Bool = true, onCaptureStateChange: ((Bool) -> Void)? = nil) {
         self.showsIntroText = showsIntroText
@@ -69,6 +71,29 @@ struct DictationShortcutEditor: View {
                     copyAgainValidationMessage = appState.setShortcut(binding, for: .copyAgain)
                 }
             )
+
+            Divider()
+            Text("Voice writing · tap to start, tap again to finish")
+                .font(.caption.weight(.semibold))
+            if let warning = appState.voiceWritingShortcutValidationMessage {
+                Text(warning).font(.caption).foregroundStyle(.orange)
+            }
+            ShortcutRoleSection(
+                role: .editLast, selection: appState.editLastShortcut,
+                validationMessage: editLastValidationMessage,
+                isCapturing: Binding(get: { activeCaptureRole == .editLast }, set: { activeCaptureRole = $0 ? .editLast : nil }),
+                onSelect: { editLastValidationMessage = appState.setShortcut($0, for: .editLast) }
+            )
+            ShortcutRoleSection(
+                role: .draftReply, selection: appState.draftReplyShortcut,
+                validationMessage: draftReplyValidationMessage,
+                isCapturing: Binding(get: { activeCaptureRole == .draftReply }, set: { activeCaptureRole = $0 ? .draftReply : nil }),
+                onSelect: { draftReplyValidationMessage = appState.setShortcut($0, for: .draftReply) }
+            )
+            Text("Edit Last: say ‘make it shorter’ or ‘undo that’ in the same field. Gmail: open a thread, click Reply, put the cursor in the body, and say what you want to reply. Drafts are inserted for you to review and send.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("These actions send your spoken instruction and the last insertion or open Gmail conversation to your configured writing model. Thread captures and voice-writing recordings are not saved in the Run Log. Accessibility and microphone access are required; Screen Recording is not.")
+                .font(.caption).foregroundStyle(.secondary)
 
             Text("Custom shortcuts can use regular keys, modifier-only shortcuts, or modifier combinations.")
                 .font(.caption)
