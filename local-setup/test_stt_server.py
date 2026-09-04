@@ -136,15 +136,18 @@ async def run_session(port, chunks_16k, pace=False, chunk_s=0.1, speed=1.0):
 
             async def reader():
                 nonlocal t_final
+                committed_item = None
                 async for msg in ws:
                     if msg.type != WSMsgType.TEXT:
                         break
                     ev = json.loads(msg.data)
                     ev["_after_commit"] = t_commit is not None
                     events.append(ev)
+                    if ev["type"] == "input_audio_buffer.committed":
+                        committed_item = ev.get("item_id")
                     if ev["type"] == "conversation.item.input_audio_transcription.completed":
                         final_parts.append(ev["transcript"])
-                        if t_commit is not None:
+                        if t_commit is not None and committed_item is not None and ev.get("item_id") == committed_item:
                             t_final = time.monotonic()
                             return
             rt = asyncio.ensure_future(reader())
@@ -214,6 +217,9 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.completed(events, True)), 1)
         self.assertEqual(text, " ".join("w%d" % k for k in words), "nothing lost, nothing duplicated")
         final = self.completed(events, True)[0]["transcript"]
+        final_id = self.completed(events, True)[0]["item_id"]
+        self.assertNotIn(final_id, [e["item_id"] for e in mid])
+        self.assertEqual(len({e["item_id"] for e in mid}), len(mid))
         self.assertLess(len(final.split()), len(words), "the tail must not re-transcribe settled words")
         await asyncio.sleep(0.2)
         pushed = [p for p in self.precached if p]
@@ -232,6 +238,13 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         after = self.completed(events, True)
         self.assertEqual(len(after), 1)
         self.assertEqual(text, " ".join("w%d" % k for k in words))
+
+    async def test_long_session_keeps_every_word_after_discarding_old_audio(self):
+        words = list(range(90))
+        events, text, _ = await run_session(self.port, [speech(words)], pace=True, speed=8)
+        self.assertGreater(len(self.completed(events, False)), 5)
+        self.assertEqual(text, " ".join("w%d" % k for k in words))
+        self.assertLess(max(self.fake.calls) / SR, stt_server.LEFT_CONTEXT_S + 7)
 
     async def test_silence_only_windows_are_skipped(self):
         events, text, _ = await run_session(self.port, [speech([1, 2]), silence(6.0)], pace=True, speed=8)
@@ -322,6 +335,26 @@ class SettleAndSpliceTests(unittest.TestCase):
 
 
 class StreamResamplerTests(unittest.TestCase):
+    def test_arbitrary_packet_sizes_preserve_phase_and_sample_count(self):
+        for rate in (24000, 44100, 48000, 8000):
+            rng = np.random.default_rng(42)
+            x = rng.normal(0, 0.1, rate + 137).astype(np.float32)
+            whole = stt_server.resample(x, rate)
+            for sizes in ([1024], [511], [1, 7, 1024, 83, 3000]):
+                with self.subTest(rate=rate, sizes=sizes):
+                    rs = stt_server.StreamResampler(rate)
+                    parts, pos, i = [], 0, 0
+                    while pos < len(x):
+                        size = sizes[i % len(sizes)]
+                        parts.append(rs.feed(x[pos:pos + size]))
+                        pos += size
+                        i += 1
+                    parts.append(rs.feed(np.zeros(0, dtype=np.float32), final=True))
+                    streamed = np.concatenate(parts)
+                    self.assertEqual(len(streamed), len(whole))
+                    np.testing.assert_allclose(streamed, whole, atol=1e-6)
+                    self.assertEqual(len(rs.feed(np.zeros(0, dtype=np.float32), final=True)), 0)
+
     def test_chunked_output_matches_whole_clip_resampling(self):
         rng = np.random.default_rng(0)
         x = rng.standard_normal(24000 * 3).astype(np.float32) * 0.1
@@ -341,6 +374,32 @@ class StreamResamplerTests(unittest.TestCase):
         rs = stt_server.StreamResampler(16000)
         x = np.ones(100, dtype=np.float32)
         self.assertIs(rs.feed(x), x)
+
+
+class AudioWindowBufferTests(unittest.TestCase):
+    def test_long_session_retains_context_without_losing_samples(self):
+        buf = stt_server.AudioWindowBuffer()
+        chunk = np.arange(1024, dtype=np.float32)
+        end = 0
+        for _ in range(10000):
+            buf.append(chunk + end)
+            end += len(chunk)
+            buf.discard_before(max(0, end - 160000))
+        self.assertEqual(buf.end, end)
+        self.assertEqual(buf.start, end - 160000)
+        np.testing.assert_array_equal(buf.snapshot(buf.start), np.arange(end - 160000, end, dtype=np.float32))
+        self.assertLessEqual(buf.storage.nbytes, 4 * 1024 * 1024)
+
+    def test_inflight_snapshot_survives_compaction_and_growth(self):
+        buf = stt_server.AudioWindowBuffer()
+        original = np.arange(300000, dtype=np.float32)
+        buf.append(original)
+        snapshot = buf.snapshot(0)
+        buf.discard_before(299000)
+        buf.append(np.ones(1000000, dtype=np.float32))
+        np.testing.assert_array_equal(snapshot, original)
+        self.assertEqual(buf.end, 1300000)
+        self.assertEqual(buf.snapshot(299000)[999], original[-1])
 
 
 class WordMergeTests(unittest.TestCase):

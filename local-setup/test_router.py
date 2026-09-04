@@ -261,6 +261,20 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(status, 504)
         self.assertLess(elapsed, 2.2, "router must give up inside the client's budget, not after")
         self.assertEqual(LOCAL.requests, [])
+        self.assertEqual(len(GROQ.seen("primary")), 1, "a timeout must not repeat the slow request")
+
+    def test_busy_hosted_connection_wait_is_bounded(self):
+        from unittest.mock import patch
+        router._groq_lock.acquire()
+        try:
+            with patch.object(router, "_resolvable", return_value=True):
+                start = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    router._groq_post(b"{}", {}, timeout=0.08)
+                self.assertLess(time.monotonic() - start, 0.4)
+            self.assertEqual(GROQ.requests, [])
+        finally:
+            router._groq_lock.release()
 
     def test_force_local_routes_only_cleanup_prompts_local_first(self):
         router.FORCE_LOCAL = True

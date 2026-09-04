@@ -1,13 +1,12 @@
 import Foundation
-import os.log
-
-private let realtimeLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "RealtimeTranscription")
 
 enum RealtimeTranscriptionError: LocalizedError {
     case invalidBaseURL(String)
     case notConnected
     case serverError(code: String, message: String)
     case closedBeforeFinal
+    case finalTimedOut
+    case alreadyCommitted
 
     var errorDescription: String? {
         switch self {
@@ -15,6 +14,8 @@ enum RealtimeTranscriptionError: LocalizedError {
         case .notConnected: return "Realtime transcription socket is not connected"
         case .serverError(let code, let message): return "Realtime server error [\(code)]: \(message)"
         case .closedBeforeFinal: return "Realtime socket closed before emitting the final transcript"
+        case .finalTimedOut: return "Realtime transcription timed out; retrying the recorded audio"
+        case .alreadyCommitted: return "Realtime audio has already been committed"
         }
     }
 }
@@ -29,29 +30,26 @@ final class RealtimeTranscriptionService {
 
     private let config: Configuration
     private let session: URLSession
+    private let finalTimeout: TimeInterval
     private var task: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
 
     private let stateQueue = DispatchQueue(label: "com.zachlatta.freeflow.realtime.state")
-    private var finalText: String = ""
-    private var partialText: String = ""
+    private var transcriptState = RealtimeTranscriptState()
     private var finalContinuation: CheckedContinuation<String, Error>?
-    private var commitSent: Bool = false
+    private var finalDeadline: DispatchWorkItem?
     private var closed: Bool = false
     private var terminalError: Error?
-    private var serverEventCount: Int = 0
-    private var commitEventCount: Int?
-    private var postCommitCompleted: Bool = false
-    private var currentItemID: String?
 
     /// Published on the main queue as partial transcript updates. The service
     /// concatenates all `completed` events and currently-streaming `delta`
     /// events — useful for a live overlay readout.
     var onPartialUpdate: ((String) -> Void)?
 
-    init(config: Configuration, session: URLSession = .shared) {
+    init(config: Configuration, session: URLSession = .shared, finalTimeout: TimeInterval = 8) {
         self.config = config
         self.session = session
+        self.finalTimeout = finalTimeout.isFinite && finalTimeout > 0 ? finalTimeout : 8
     }
 
     // MARK: Lifecycle
@@ -83,23 +81,9 @@ final class RealtimeTranscriptionService {
         sendSessionUpdate()
     }
 
-    /// Cancel the socket and any in-flight receive. Safe to call multiple times.
+    /// Closing the socket also releases any in-flight receive. Safe to repeat.
     func cancel() {
-        let currentTask: URLSessionWebSocketTask? = stateQueue.sync {
-            let currentTask = task
-            task = nil
-            return currentTask
-        }
-        stateQueue.sync {
-            guard !closed else { return }
-            closed = true
-            if let cont = finalContinuation {
-                finalContinuation = nil
-                cont.resume(throwing: CancellationError())
-            }
-        }
-        receiveTask?.cancel()
-        currentTask?.cancel(with: .normalClosure, reason: nil)
+        fail(CancellationError())
     }
 
     // MARK: Producer
@@ -109,7 +93,7 @@ final class RealtimeTranscriptionService {
     /// OpenAI Realtime default).
     func appendPCM16(_ data: Data) {
         let currentTask: URLSessionWebSocketTask? = stateQueue.sync {
-            task
+            closed || transcriptState.commitSent ? nil : task
         }
         guard let currentTask, !data.isEmpty else { return }
         let audioB64 = data.base64EncodedString()
@@ -120,47 +104,43 @@ final class RealtimeTranscriptionService {
         send(message, over: currentTask)
     }
 
-    /// Signal end-of-input, wait for the final transcript, return it.
+    /// Signal end-of-input and await the acknowledged item's final transcript.
+    /// A silent peer must release the caller to its file-upload fallback.
     func commitAndAwaitFinal() async throws -> String {
-        let currentTask: URLSessionWebSocketTask? = stateQueue.sync {
-            task
-        }
-        guard let currentTask else {
-            throw RealtimeTranscriptionError.notConnected
-        }
-        let alreadyCommitted: Bool = stateQueue.sync {
-            if commitSent { return true }
-            commitSent = true
-            commitEventCount = serverEventCount
-            postCommitCompleted = false
-            return false
-        }
-        if !alreadyCommitted {
-            send(["type": "input_audio_buffer.commit"], over: currentTask)
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            var immediateResult: Result<String, Error>?
-            stateQueue.sync {
-                if let terminalError {
-                    immediateResult = .failure(terminalError)
-                    return
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                var currentTask: URLSessionWebSocketTask?
+                var immediateError: Error?
+                stateQueue.sync {
+                    if let terminalError { immediateError = terminalError; return }
+                    guard !closed else {
+                        immediateError = RealtimeTranscriptionError.closedBeforeFinal; return
+                    }
+                    guard let task else {
+                        immediateError = RealtimeTranscriptionError.notConnected; return
+                    }
+                    guard !transcriptState.commitSent else {
+                        immediateError = RealtimeTranscriptionError.alreadyCommitted; return
+                    }
+                    transcriptState.beginCommit()
+                    finalContinuation = continuation
+                    currentTask = task
+                    let deadline = DispatchWorkItem { [weak self] in
+                        self?.fail(RealtimeTranscriptionError.finalTimedOut)
+                    }
+                    finalDeadline = deadline
+                    DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                        deadline: .now() + finalTimeout, execute: deadline)
                 }
-                if closed {
-                    immediateResult = .failure(RealtimeTranscriptionError.closedBeforeFinal)
-                    return
+                if let immediateError {
+                    continuation.resume(throwing: immediateError)
+                } else if let currentTask {
+                    send(["type": "input_audio_buffer.commit"], over: currentTask)
                 }
-                if let finalText = readyCommittedTranscriptLocked() {
-                    closed = true
-                    immediateResult = .success(finalText)
-                    return
-                }
-                finalContinuation = continuation
             }
-            if let immediateResult {
-                currentTask.cancel(with: .normalClosure, reason: nil)
-                continuation.resume(with: immediateResult)
-            }
+        } onCancel: {
+            self.cancel()
         }
     }
 
@@ -193,17 +173,25 @@ final class RealtimeTranscriptionService {
     }
 
     private func finishWithClose() {
-        stateQueue.sync {
+        fail(RealtimeTranscriptionError.closedBeforeFinal)
+    }
+
+    private func fail(_ error: Error) {
+        var continuation: CheckedContinuation<String, Error>?
+        let currentTask: URLSessionWebSocketTask? = stateQueue.sync {
+            guard !closed else { return nil }
             closed = true
-            if let cont = finalContinuation {
-                finalContinuation = nil
-                if postCommitCompleted {
-                    cont.resume(returning: finalText)
-                } else {
-                    cont.resume(throwing: RealtimeTranscriptionError.closedBeforeFinal)
-                }
-            }
+            terminalError = error
+            finalDeadline?.cancel()
+            finalDeadline = nil
+            continuation = finalContinuation
+            finalContinuation = nil
+            let currentTask = task
+            task = nil
+            return currentTask
         }
+        continuation?.resume(throwing: error)
+        currentTask?.cancel(with: .normalClosure, reason: nil)
     }
 
     private func handleServerEvent(_ text: String) {
@@ -213,58 +201,29 @@ final class RealtimeTranscriptionService {
             return
         }
 
-        stateQueue.sync {
-            serverEventCount += 1
-        }
+        guard stateQueue.sync(execute: { !closed }) else { return }
 
         switch eventType {
         case "conversation.item.input_audio_transcription.delta":
-            if let itemID = json["item_id"] as? String {
-                stateQueue.sync {
-                    currentItemID = itemID
-                }
-            }
             if let delta = json["delta"] as? String, !delta.isEmpty {
                 appendDelta(delta)
             }
             resumeIfReadyAfterCommit()
         case "conversation.item.input_audio_transcription.completed":
-            stateQueue.sync {
-                if let commitEventCount, serverEventCount > commitEventCount {
-                    postCommitCompleted = true
-                }
-            }
-            if let itemID = json["item_id"] as? String {
-                stateQueue.sync {
-                    currentItemID = itemID
-                }
-            }
             if let transcript = json["transcript"] as? String {
-                commitSegment(transcript)
-            } else {
-                resumeIfReadyAfterCommit()
+                commitSegment(transcript, itemID: json["item_id"] as? String)
             }
         case "input_audio_buffer.committed":
-            if let itemID = json["item_id"] as? String {
-                stateQueue.sync {
-                    currentItemID = itemID
-                }
+            stateQueue.sync {
+                transcriptState.acknowledgeCommit(itemID: json["item_id"] as? String)
             }
             resumeIfReadyAfterCommit()
         case "error":
             let errObj = json["error"] as? [String: Any]
             let code = errObj?["code"] as? String ?? "unknown"
             let message = errObj?["message"] as? String ?? "unknown realtime error"
-            os_log(.error, log: realtimeLog, "server error [%{public}@]: %{public}@", code, message)
             let error = RealtimeTranscriptionError.serverError(code: code, message: message)
-            stateQueue.sync {
-                terminalError = error
-                closed = true
-                if let cont = finalContinuation {
-                    finalContinuation = nil
-                    cont.resume(throwing: error)
-                }
-            }
+            fail(error)
         default:
             resumeIfReadyAfterCommit()
             break
@@ -273,21 +232,16 @@ final class RealtimeTranscriptionService {
 
     private func appendDelta(_ delta: String) {
         let snapshot: String = stateQueue.sync {
-            partialText += delta
-            return finalText + partialText
+            transcriptState.appendDelta(delta)
+            return transcriptState.finalText + transcriptState.partialText
         }
         reportPartial(snapshot)
     }
 
-    private func commitSegment(_ transcript: String) {
+    private func commitSegment(_ transcript: String, itemID: String?) {
         let snapshot: String = stateQueue.sync {
-            let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                if !finalText.isEmpty { finalText += " " }
-                finalText += trimmed
-            }
-            partialText = ""
-            return finalText
+            transcriptState.complete(transcript, itemID: itemID)
+            return transcriptState.finalText
         }
         reportPartial(snapshot)
         resumeIfReadyAfterCommit()
@@ -307,9 +261,9 @@ final class RealtimeTranscriptionService {
               let text = String(data: data, encoding: .utf8) else {
             return
         }
-        task.send(.string(text)) { error in
+        task.send(.string(text)) { [weak self] error in
             if let error {
-                os_log(.error, log: realtimeLog, "send failed: %{public}@", error.localizedDescription)
+                self?.fail(error)
             }
         }
     }
@@ -384,11 +338,13 @@ final class RealtimeTranscriptionService {
         var pendingResume: (CheckedContinuation<String, Error>, String)?
         stateQueue.sync {
             guard let cont = finalContinuation,
-                  let finalText = readyCommittedTranscriptLocked() else {
+                  let finalText = transcriptState.readyTranscript, !closed else {
                 return
             }
             finalContinuation = nil
             closed = true
+            finalDeadline?.cancel()
+            finalDeadline = nil
             pendingResume = (cont, finalText)
         }
         if let (cont, text) = pendingResume {
@@ -400,12 +356,4 @@ final class RealtimeTranscriptionService {
         }
     }
 
-    private func readyCommittedTranscriptLocked() -> String? {
-        guard commitSent,
-              partialText.isEmpty,
-              postCommitCompleted else {
-            return nil
-        }
-        return finalText
-    }
 }

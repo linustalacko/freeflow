@@ -24,9 +24,10 @@ enum TranscriptFastPath {
     static let defaultMaxWords = 60
     static let maxWordsDefaultsKey = "clean_transcript_fast_path_max_words"
 
-    /// Removed outright.
+    /// Unambiguous hesitation sounds. Keep "mm" (units), "ER" (an acronym)
+    /// and acknowledgements such as "mhm"/"hmm" that can carry meaning.
     private static let fillerWords: Set<String> = [
-        "um", "uh", "uhm", "umm", "uhh", "erm", "er", "ah", "eh", "hmm", "hm", "mhm", "mm",
+        "um", "uh", "uhm", "umm", "uhh", "erm",
     ]
 
     /// Anything the model has to *interpret* → bail. Matched on lowercased,
@@ -60,9 +61,13 @@ enum TranscriptFastPath {
         _ raw: String,
         maxWords: Int,
         vocabulary: String,
-        profile: DictationProfile
+        profile: DictationProfile,
+        customSystemPrompt: String = "",
+        outputLanguage: String = ""
     ) -> String? {
-        guard maxWords > 0 else { return nil }
+        guard maxWords > 0,
+              customSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         // STT emits mid-sentence line breaks; the model would join them.
         var text = raw
             .components(separatedBy: .newlines)

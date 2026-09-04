@@ -72,6 +72,7 @@ except Exception:  # pragma: no cover
     def profile_from_system_prompt(system_prompt):
         return None
 import threading
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -283,22 +284,39 @@ def _resolvable(host, timeout=None):
 def _groq_post(body_bytes, headers, timeout):
     """POST to Groq reusing a pooled connection. Returns (status, headers, body)."""
     global _groq_conn
+    deadline = time.monotonic() + timeout
+
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError("hosted request deadline expired")
+        return budget
+
     if hosted_breaker_open():
         raise BackendError("groq", 0, "hosted breaker open (%.0fs left)" % (_hosted_down_until - time.monotonic()))
-    if not _resolvable(_groq_parts.hostname):
+    if not _resolvable(_groq_parts.hostname, timeout=min(DNS_TIMEOUT_S, remaining())):
         _trip_hosted_breaker("dns unresolvable")
         raise BackendError("groq", 0, "dns: %s unresolvable" % _groq_parts.hostname)
-    with _groq_lock:
+    # A context request may still own the pooled socket at key-up. Waiting for
+    # it consumes this request's budget too; never block cleanup indefinitely.
+    if not _groq_lock.acquire(timeout=remaining()):
+        raise TimeoutError("hosted connection busy")
+    try:
         for attempt in (0, 1):
             try:
+                budget = remaining()
                 if _groq_conn is None:
                     cls = http.client.HTTPSConnection if _groq_parts.scheme == "https" else http.client.HTTPConnection
-                    _groq_conn = cls(_groq_parts.hostname, _groq_parts.port, timeout=timeout)
-                _groq_conn.timeout = timeout
+                    _groq_conn = cls(_groq_parts.hostname, _groq_parts.port, timeout=budget)
+                _groq_conn.timeout = budget
                 if _groq_conn.sock is not None:
-                    _groq_conn.sock.settimeout(timeout)
+                    _groq_conn.sock.settimeout(budget)
                 _groq_conn.request("POST", _groq_parts.path, body=body_bytes, headers=headers)
+                if _groq_conn.sock is not None:
+                    _groq_conn.sock.settimeout(remaining())
                 resp = _groq_conn.getresponse()
+                if _groq_conn.sock is not None:
+                    _groq_conn.sock.settimeout(remaining())
                 data = resp.read()
                 return resp.status, dict(resp.getheaders()), data
             except (http.client.HTTPException, ConnectionError, BrokenPipeError, OSError) as e:
@@ -309,9 +327,13 @@ def _groq_post(body_bytes, headers, timeout):
                 except Exception:
                     pass
                 _groq_conn = None
-                if attempt == 1 or isinstance(e, TimeoutError):
+                # On macOS's Python 3.9, socket.timeout is not TimeoutError.
+                # Retrying it used to spend the entire timeout a second time.
+                if attempt == 1 or isinstance(e, (TimeoutError, socket.timeout)):
                     _trip_hosted_breaker(type(e).__name__)
                     raise
+    finally:
+        _groq_lock.release()
 
 
 def _content_parts(content):

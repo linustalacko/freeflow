@@ -19,6 +19,8 @@ TEST_PRODUCTION_SOURCES = \
 	Sources/LLMAPITransport.swift \
 	Sources/LLMCooldownManager.swift \
 	Sources/ModelConfiguration.swift \
+	Sources/RealtimeTranscriptState.swift \
+	Sources/RealtimeTranscriptionService.swift \
 	Sources/SpokenFormatting.swift \
 	Sources/TranscriptFastPath.swift \
 	Sources/TranscriptTextCore.swift \

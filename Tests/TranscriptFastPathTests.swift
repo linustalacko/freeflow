@@ -8,6 +8,7 @@ enum TranscriptFastPathTests {
         testInterpretationStillBailsToTheModel()
         testProfileShapesTerminalPunctuation()
         testEmailGreetingBailsOnlyInMailApps()
+        testShortUtterancesHonorUserOptions()
     }
 
     private static let chat = DictationProfileResolver.profile(for: .chat)
@@ -16,8 +17,29 @@ enum TranscriptFastPathTests {
     private static let document = DictationProfileResolver.profile(for: .document)
     private static let unknown = DictationProfileResolver.profile(for: .unknown)
 
+    private static func testShortUtterancesHonorUserOptions() {
+        TestSupport.expectEqual(TranscriptFastPath.cleanedIfAlreadyClean(
+            "Thanks", maxWords: 60, vocabulary: "", profile: chat,
+            outputLanguage: "French"), nil)
+        TestSupport.expectEqual(TranscriptFastPath.cleanedIfAlreadyClean(
+            "Thanks", maxWords: 60, vocabulary: "", profile: chat,
+            customSystemPrompt: "Use a formal salutation."), nil)
+        TestSupport.expectEqual(TranscriptFastPath.cleanedIfAlreadyClean(
+            "acme", maxWords: 60, vocabulary: "ACME", profile: chat), nil)
+        TestSupport.expectEqual(TranscriptFastPath.cleanedIfAlreadyClean(
+            "Thanks", maxWords: 0, vocabulary: "", profile: chat), nil)
+        expectClean("sounds good", profile: chat, "Sounds good")
+        expectClean("hello comma friend", profile: chat, "Hello, friend")
+        expectBails("no actually Wednesday", profile: chat)
+    }
+
     private static func testFillersAndPunctuationAreHandled() {
         expectClean("um so the deploy is done", profile: unknown, "So the deploy is done.")
+        expectClean("the gap is 5 mm wide", profile: document, "The gap is 5 mm wide.")
+        expectClean("take it to the ER", profile: document, "Take it to the ER.")
+        expectClean("mhm that could work", profile: chat, "Mhm that could work")
+        expectClean("hmm that seems unlikely", profile: chat, "Hmm that seems unlikely")
+        expectClean("5 mm", profile: chat, "5 mm")
         // A dictated "comma" becomes a comma. Checked against a document target
         // so the assertion is about punctuation conversion, not the casual rule.
         expectClean("hi dana comma thanks for the update", profile: document, "Hi dana, thanks for the update.")
