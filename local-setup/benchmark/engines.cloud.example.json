@@ -1,0 +1,25 @@
+{
+  "engines": [
+    {
+      "id": "groq-whisper-large-v3",
+      "kind": "multipart",
+      "url": "https://api.groq.com/openai/v1/audio/transcriptions",
+      "model": "whisper-large-v3",
+      "api_key_env": "GROQ_API_KEY"
+    },
+    {
+      "id": "groq-whisper-turbo",
+      "kind": "multipart",
+      "url": "https://api.groq.com/openai/v1/audio/transcriptions",
+      "model": "whisper-large-v3-turbo",
+      "api_key_env": "GROQ_API_KEY"
+    },
+    {
+      "id": "deepgram-nova-3",
+      "kind": "deepgram",
+      "url": "https://api.deepgram.com/v1/listen",
+      "model": "nova-3",
+      "api_key_env": "DEEPGRAM_API_KEY"
+    }
+  ]
+}

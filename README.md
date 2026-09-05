@@ -189,6 +189,10 @@ the global hotkey needs all three.
 
 ## Tests and benchmarks
 
+For raw speech recognition accuracy and latency comparisons against Whisper,
+see [the ASR benchmark setup](local-setup/benchmark/README.md). It uses explicit
+audio/reference pairs and includes a synthetic smoke corpus and public-corpus importer.
+
 ```bash
 make check                                    # typecheck + Swift tests + plist/YAML validation
 python3 local-setup/test_router.py            # router: rate limits, fallback, precache, and the app's request shape pinned to the Swift source

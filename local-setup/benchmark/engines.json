@@ -1,0 +1,28 @@
+{
+  "engines": [
+    {
+      "id": "freeflow-stream",
+      "kind": "freeflow-stream",
+      "url": "http://127.0.0.1:18082/v1",
+      "model": "mlx-community/parakeet-tdt-0.6b-v2"
+    },
+    {
+      "id": "freeflow-batch",
+      "kind": "multipart",
+      "url": "http://127.0.0.1:18082/v1/audio/transcriptions",
+      "model": "mlx-community/parakeet-tdt-0.6b-v2"
+    },
+    {
+      "id": "whisper-turbo-q5",
+      "kind": "multipart",
+      "url": "http://127.0.0.1:18080/inference",
+      "model": "large-v3-turbo-q5_0"
+    },
+    {
+      "id": "whisper-base-en",
+      "kind": "multipart",
+      "url": "http://127.0.0.1:18081/inference",
+      "model": "base.en"
+    }
+  ]
+}

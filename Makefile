@@ -92,7 +92,11 @@ endif
 	@codesign --force --options runtime --sign "$(CODESIGN_IDENTITY)" --entitlements FreeFlow.entitlements "$(APP_BUNDLE)"
 	@echo "Built $(APP_BUNDLE)"
 
-check: typecheck test validate
+check: typecheck test validate benchmark-test
+
+.PHONY: benchmark-test
+benchmark-test:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s local-setup/benchmark -p 'test_*.py'
 
 typecheck:
 	swiftc \
