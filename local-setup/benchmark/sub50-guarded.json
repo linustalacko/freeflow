@@ -1,0 +1,4 @@
+[
+  {"id": "guarded-quant8-context1", "env": {"EXP_SESSION": "guarded", "EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "8", "STT_LEFT_CONTEXT_S": "1", "STT_PARTIAL_EVERY_S": "0.25", "EXP_AGREEMENT_AGE_S": "1"}},
+  {"id": "guarded-quant4-context05", "env": {"EXP_SESSION": "guarded", "EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "4", "STT_LEFT_CONTEXT_S": "0.5", "STT_PARTIAL_EVERY_S": "0.25", "EXP_AGREEMENT_AGE_S": "1"}}
+]

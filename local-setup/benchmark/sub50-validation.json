@@ -1,0 +1,5 @@
+[
+  {"id": "baseline", "env": {}},
+  {"id": "quant8-context1", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "8", "STT_LEFT_CONTEXT_S": "1", "STT_PARTIAL_EVERY_S": "0.25"}},
+  {"id": "quant4-context05", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "4", "STT_LEFT_CONTEXT_S": "0.5", "STT_PARTIAL_EVERY_S": "0.25"}}
+]

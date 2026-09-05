@@ -1,0 +1,4 @@
+[
+  {"id": "compiled-decoder-default-streaming", "env": {"EXP_DECODER": "compiled-cache"}},
+  {"id": "quant8-default-streaming", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "8"}}
+]

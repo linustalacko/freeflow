@@ -1,0 +1,5 @@
+[
+  {"id": "quant8-context10-fast-cadence", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "8", "STT_LEFT_CONTEXT_S": "10", "STT_PARTIAL_EVERY_S": "0.25"}},
+  {"id": "quant8-context2-moderate-cadence", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "8", "STT_LEFT_CONTEXT_S": "2", "STT_PARTIAL_EVERY_S": "0.5"}},
+  {"id": "quant4-context1-pause-settling", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "4", "STT_LEFT_CONTEXT_S": "1", "STT_PARTIAL_EVERY_S": "0.25", "STT_SETTLE_GAP_S": "0.16"}}
+]

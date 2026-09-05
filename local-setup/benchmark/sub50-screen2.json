@@ -1,0 +1,8 @@
+[
+  {"id": "baseline", "env": {}},
+  {"id": "encoder8-context2", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "8", "STT_LEFT_CONTEXT_S": "2", "STT_PARTIAL_EVERY_S": "0.5"}},
+  {"id": "encoder4-context2", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "4", "STT_LEFT_CONTEXT_S": "2", "STT_PARTIAL_EVERY_S": "0.5"}},
+  {"id": "compiled-context2", "env": {"EXP_DECODER": "compiled-cache", "EXP_COMPILE_ENCODER": "1", "STT_LEFT_CONTEXT_S": "2", "STT_PARTIAL_EVERY_S": "0.5"}},
+  {"id": "compiled-context1", "env": {"EXP_DECODER": "compiled-cache", "EXP_COMPILE_ENCODER": "1", "STT_LEFT_CONTEXT_S": "1", "STT_PARTIAL_EVERY_S": "0.5"}},
+  {"id": "compiled-context05", "env": {"EXP_DECODER": "compiled-cache", "EXP_COMPILE_ENCODER": "1", "STT_LEFT_CONTEXT_S": "0.5", "STT_PARTIAL_EVERY_S": "0.25"}}
+]

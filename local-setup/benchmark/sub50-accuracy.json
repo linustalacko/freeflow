@@ -1,0 +1,8 @@
+[
+  {"id": "baseline", "env": {}},
+  {"id": "compiled-cache", "env": {"EXP_DECODER": "compiled-cache"}},
+  {"id": "float16", "env": {"EXP_DECODER": "compiled-cache", "EXP_DTYPE": "float16"}},
+  {"id": "float16-compiled", "env": {"EXP_DECODER": "compiled-cache", "EXP_DTYPE": "float16", "EXP_COMPILE_ENCODER": "1"}},
+  {"id": "encoder-int8", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "8"}},
+  {"id": "encoder-int4", "env": {"EXP_DECODER": "compiled-cache", "EXP_QUANTIZE_BITS": "4"}}
+]

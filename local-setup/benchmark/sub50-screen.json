@@ -1,0 +1,10 @@
+[
+  {"id":"baseline","env":{}},
+  {"id":"compiled-decode","env":{"EXP_DECODER":"compiled"}},
+  {"id":"compiled-encoder-decode","env":{"EXP_DECODER":"compiled","EXP_COMPILE_ENCODER":"1"}},
+  {"id":"fast-context2-cadence05","env":{"EXP_DECODER":"compiled-cache","STT_LEFT_CONTEXT_S":"2","STT_PARTIAL_EVERY_S":"0.5"}},
+  {"id":"native-right4-chunk05","env":{"EXP_SESSION":"cached","EXP_DECODER":"compiled-cache","EXP_RIGHT_CONTEXT":"4","EXP_CHUNK_S":"0.5"}},
+  {"id":"native-right8-chunk05","env":{"EXP_SESSION":"cached","EXP_DECODER":"compiled-cache","EXP_RIGHT_CONTEXT":"8","EXP_CHUNK_S":"0.5"}},
+  {"id":"native-right4-chunk025","env":{"EXP_SESSION":"cached","EXP_DECODER":"compiled-cache","EXP_RIGHT_CONTEXT":"4","EXP_CHUNK_S":"0.25"}},
+  {"id":"native-full-attention","env":{"EXP_SESSION":"cached","EXP_DECODER":"compiled-cache","EXP_RIGHT_CONTEXT":"4","EXP_CHUNK_S":"0.5","EXP_KEEP_ATTENTION":"1"}}
+]
