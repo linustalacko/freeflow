@@ -1,38 +1,36 @@
 import AppKit
 import SwiftUI
-import ImageIO
+
+private enum JournalSample {
+    case captured(Date, String, String, String)
+    case skipped(String)
+}
 
 @MainActor
 final class ActivityJournal: ObservableObject {
     static let shared = ActivityJournal()
+    @Published private var session = JournalSession()
+    var enabled: Bool { session.enabled }
     @Published private(set) var records: [RawCaptureIndex] = []
-    @Published private(set) var enabled = true
-    @Published private(set) var todayCount = 0
-    private var todayIDs = Set<UUID>()
-    private var countDay = RawCaptureJSON.day(Date())
-    @Published private(set) var status = "Paused"
-    @Published private(set) var modelStatus = "Apple OCR · local text model"
+    @Published private(set) var status = "Stopped"
     @Published private(set) var storageError: String?
     @Published private(set) var exporting = false
-    @Published private(set) var captureInterval = JournalCore.captureInterval(UserDefaults.standard.double(forKey: "journal_capture_interval"))
+    @Published private(set) var captureInterval = JournalCore.captureInterval(UserDefaults.standard.double(forKey: "journal_lightweight_interval"))
     @Published var excludedApps = UserDefaults.standard.string(forKey: "journal_excluded_apps") ?? "" {
         didSet { UserDefaults.standard.set(excludedApps, forKey: "journal_excluded_apps") }
     }
-    @Published var inputMode = JournalInputMode(rawValue: UserDefaults.standard.string(forKey: "journal_input_mode") ?? "") ?? .ocr {
-        didSet { UserDefaults.standard.set(inputMode.rawValue, forKey: "journal_input_mode") }
-    }
     private let root: URL
     private let store: RawCaptureStore
-    private var selectedDay = RawCaptureJSON.day(Date())
+    private let runtime = JournalModelRuntime()
+    private var selectedDay = Date()
     private var viewGeneration = UUID()
     private var timer: Timer?
-    private var started = false
     private var suspended = false
     private var observers: [NSObjectProtocol] = []
-    private var capturing = false
-    private var generation = UUID()
-    private var inferenceTask: Task<Void, Never>?
+    private var captureTask: Task<Void, Never>?
+    private var deduplicator = JournalDeduplicator()
     private var window: NSWindow?
+    private var prepared = false
 
     private init() {
         root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -41,12 +39,23 @@ final class ActivityJournal: ObservableObject {
     }
 
     func start() {
-        guard !started else { return }
-        started = true
+        guard !enabled, storageError == nil else { return }
+        guard CGPreflightScreenCaptureAccess() else { status = "Screen Recording permission required"; showWindow(); return }
+        guard JournalModelRuntime.executable != nil else { status = JournalModelRuntime.Failure.notInstalled.localizedDescription; showWindow(); return }
+        session.setEnabled(true)
+        deduplicator.reset()
+        suspended = false
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.suspended = true; self?.generation = UUID() }
+                Task { @MainActor in
+                    guard let self, self.enabled else { return }
+                    self.suspended = true
+                    self.session.invalidate()
+                    self.captureTask?.cancel()
+                    self.runtime.stop()
+                    self.status = "Asleep · no screenshots"
+                }
             })
         }
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
@@ -54,62 +63,51 @@ final class ActivityJournal: ObservableObject {
                 Task { @MainActor in self?.suspended = false }
             })
         }
-        Task {
-            do {
-                try await store.removeSourceMaterial()
-                var all = try await store.list()
-                // In-memory images cannot resume after restart. Keep explicit status, never fabricate OCR.
-                for item in all where item.inferenceStatus == "pending" {
-                    _ = try await store.saveInference(RawInference(status: "interrupted", error: "Image no longer retained."), index: item)
-                }
-                all = try await store.list()
-                todayIDs = Set(all.filter { Calendar.current.isDateInToday($0.capturedAt) }.map(\.id))
-                todayCount = todayIDs.count
-                records = all.filter { $0.day == selectedDay }
-                configureTimer()
-                capture()
-            } catch { failStorage() }
-        }
+        status = "Journal running"
+        configureTimer()
+        capture()
     }
 
+    func stop() {
+        session.setEnabled(false)
+        timer?.invalidate()
+        timer = nil
+        for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        observers.removeAll()
+        captureTask?.cancel()
+        runtime.stop()
+        deduplicator.reset()
+        status = "Stopped"
+    }
+
+    func shutdown() { stop() }
+
     func showDay(_ day: Date) {
-        selectedDay = RawCaptureJSON.day(day)
+        selectedDay = day
         let token = UUID()
         viewGeneration = token
-        let key = selectedDay
         Task {
             do {
-                let items = try await store.list(day: key)
+                let items = try await store.list(on: day)
                 if viewGeneration == token { records = items }
-            } catch { storageError = "Could not read captures. Summaries have been preserved." }
+            } catch { storageError = "Could not read summaries. Existing data has been preserved." }
         }
     }
 
     func setCaptureInterval(_ seconds: Double) {
-        let interval = JournalCore.captureInterval(seconds)
-        guard interval != captureInterval else { return }
-        captureInterval = interval
-        UserDefaults.standard.set(interval, forKey: "journal_capture_interval")
+        captureInterval = JournalCore.captureInterval(seconds)
+        UserDefaults.standard.set(captureInterval, forKey: "journal_lightweight_interval")
         configureTimer()
     }
 
     private func configureTimer() {
-        timer?.invalidate(); timer = nil
+        timer?.invalidate()
+        timer = nil
         guard enabled, storageError == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: captureInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.capture() }
         }
-        timer?.tolerance = min(1, captureInterval * 0.05)
-    }
-
-    func setEnabled(_ value: Bool) {
-        guard storageError == nil else { return }
-        generation = UUID()
-        enabled = value
-        UserDefaults.standard.set(value, forKey: "journal_enabled")
-        configureTimer()
-        status = value ? "Starting…" : "Paused"
-        if value { capture() }
+        timer?.tolerance = min(15, captureInterval * 0.1)
     }
 
     func requestCapturePermission() {
@@ -125,125 +123,108 @@ final class ActivityJournal: ObservableObject {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
     }
 
-    func shutdown() {
-        generation = UUID()
-        timer?.invalidate()
-        // Screenshot buffers are memory-only and are released when the process exits.
-    }
-
     private func publish(_ index: RawCaptureIndex) {
-        refreshCountDay()
-        if Calendar.current.isDateInToday(index.capturedAt) { todayIDs.insert(index.id); todayCount = todayIDs.count }
-        guard index.day == selectedDay else { return }
+        guard Calendar.current.isDate(index.capturedAt, inSameDayAs: selectedDay) else { return }
         if let position = records.firstIndex(where: { $0.id == index.id }) { records[position] = index }
         else { records.append(index) }
     }
 
     private func failStorage() {
-        storageError = "Recording stopped. Check disk space and file access, then restart the app. Summaries are preserved."
-        enabled = false
-        UserDefaults.standard.set(false, forKey: "journal_enabled")
-        configureTimer()
-    }
-
-    private func refreshCountDay() {
-        let current = RawCaptureJSON.day(Date())
-        if current != countDay { countDay = current; todayIDs.removeAll(); todayCount = 0 }
+        stop()
+        storageError = "Journal stopped. Check disk space and file access, then restart the app. Summaries are preserved."
     }
 
     private func capture() {
-        refreshCountDay()
         guard enabled, storageError == nil else { return }
-        guard !suspended else { status = "Asleep · no screenshots"; return }
-        if let session = CGSessionCopyCurrentDictionary() as? [String: Any], session["CGSSessionScreenIsLocked"] as? Bool == true {
+        let idle = JournalCapture.idleSeconds()
+        guard session.canCapture(busy: captureTask != nil, suspended: suspended, idleSeconds: idle) else {
+            if captureTask == nil { status = suspended ? "Asleep · no screenshots" : "Idle · no screenshots" }
+            return
+        }
+        if let state = CGSessionCopyCurrentDictionary() as? [String: Any], state["CGSSessionScreenIsLocked"] as? Bool == true {
             status = "Locked · no screenshots"; return
         }
-        guard CGPreflightScreenCaptureAccess() else { status = "Screen Recording permission required"; return }
-        guard !capturing else { status = "Finishing the previous screenshot"; return }
+        guard CGPreflightScreenCaptureAccess() else { stop(); status = "Screen Recording permission required"; return }
         guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier != Bundle.main.bundleIdentifier,
               !JournalCore.excluded(bundleID: app.bundleIdentifier ?? "", name: app.localizedName ?? "", custom: excludedApps) else {
             status = "Excluded app · no screenshots"; return
         }
-        capturing = true
-        let token = generation
-        let requestedAt = Date()
-        let idle = JournalCapture.idleSeconds()
-        let interval = captureInterval
-        let mode = inputMode
+        let token = session.generation
         let pid = app.processIdentifier
         let name = app.localizedName ?? "Unknown app"
-        let bundle = app.bundleIdentifier
-        let executable = app.executableURL?.path
-        Task {
-            defer { capturing = false }
+        let previous = deduplicator
+        status = "Reading screen"
+        captureTask = Task(priority: .utility) {
+            var pending: RawCaptureIndex?
             do {
-                let result = try await Task.detached(priority: .utility) { () -> (JournalCapture.WindowCapture, Data)? in
-                    guard let capture = try await JournalCapture.captureWindow(pid: pid),
-                          let png = NSBitmapImageRep(cgImage: capture.image).representation(using: .png, properties: [:]) else { return nil }
-                    return (capture, png)
-                }.value
-                guard token == generation, enabled else { return }
-                guard let (capture, png) = result else { status = "Window unavailable or private · skipped"; return }
-                let zone = TimeZone.current
-                let record = RawObservation(id: UUID(), requestedAt: requestedAt, capturedAt: capture.capturedAt,
-                    localTimestamp: RawCaptureJSON.timestamp(capture.capturedAt, timeZone: zone), timeZoneIdentifier: zone.identifier,
-                    utcOffsetSeconds: zone.secondsFromGMT(for: capture.capturedAt), intervalSeconds: interval, idleSeconds: idle.isFinite ? idle : nil,
-                    appName: name, bundleIdentifier: bundle, processID: pid, executablePath: executable,
-                    windowID: capture.windowID, windowTitle: capture.title, windowBounds: RawRect(capture.bounds),
-                    imageWidth: capture.image.width, imageHeight: capture.image.height,
-                    osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
-                    documentURL: capture.documentURL, focusedElementRole: capture.focusedRole,
-                    frontmostAtCompletion: NSWorkspace.shared.frontmostApplication?.processIdentifier == pid)
-                let index = try await store.save(record, model: mode.model)
-                publish(index)
-                if inferenceTask == nil { runInference(index: index, record: record, png: png, mode: mode) }
-                else {
-                    publish(try await store.saveInference(RawInference(model: mode.model, status: "skipped", error: "Previous description still processing. Image discarded."), index: index))
-                }
-                status = "Reading the screen every \(Int(captureInterval)) seconds"
-            } catch {
-                // Capture API failures do not destroy prior captures or their processing queue.
-                status = "Capture failed; retrying at the next interval"
-                if (error as NSError).domain == NSCocoaErrorDomain { failStorage() }
-            }
-        }
-    }
-
-    private func runInference(index: RawCaptureIndex, record: RawObservation, png: Data, mode: JournalInputMode) {
-        modelStatus = "Describing screenshot locally"
-        inferenceTask = Task {
-            do {
-                let inference: RawInference
-                do {
-                    var observations = "Window: \(record.windowTitle)"
-                    if mode == .ocr {
-                        let text = try await Task.detached(priority: .utility) {
-                            guard let source = CGImageSourceCreateWithData(png as CFData, nil),
-                                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw CocoaError(.fileReadCorruptFile) }
-                            return try JournalCapture.literalOCR(image: image).text
-                        }.value
-                        observations += "\nOCR: " + String(text.prefix(18000))
+                if !prepared {
+                    try await store.removeSourceMaterial()
+                    for item in try await store.list(on: Date()) where item.inferenceStatus == "pending" {
+                        _ = try await store.saveInference(RawInference(status: "interrupted", error: "Previous session ended."), index: item)
                     }
-                    let result = try await JournalLocalModel.summarize(app: record.appName,
-                        observations: observations, screenshotPNG: mode == .vision ? png : Data(), mode: mode)
-                    inference = RawInference(model: mode.model, status: "complete", completedAt: Date(), summary: result.summary, category: result.category, confidence: result.confidence,
-                                             modelInputCharacterLimit: mode == .ocr ? 18000 : 0, inputMode: mode.rawValue)
-                } catch {
-                    inference = RawInference(model: mode.model, status: "failed", completedAt: Date(), error: "Local model unavailable or response invalid. Screenshot discarded.",
-                                             modelInputCharacterLimit: mode == .ocr ? 18000 : 0, inputMode: mode.rawValue)
+                    prepared = true
                 }
-                let updated = try await store.saveInference(inference, index: index)
-                publish(updated)
-            } catch { failStorage() }
-            inferenceTask = nil
-            modelStatus = inputMode == .ocr ? "Apple OCR · local text model" : "Qwen 3.5 · 9B vision"
+                try Task.checkCancellation()
+                // The image lives only in this child task and is released before model loading.
+                let worker = Task.detached(priority: .utility) { () -> JournalSample in
+                    guard let capture = try await JournalCapture.captureWindow(pid: pid) else { return .skipped("Window unavailable or private · skipped") }
+                    let context = "\(pid):\(capture.windowID)"
+                    let imageHash = JournalCapture.imageFingerprint(capture.image, context: context)
+                    guard !previous.hasImage(imageHash) else { return .skipped("Unchanged screen · skipped") }
+                    try Task.checkCancellation()
+                    let text = try JournalCapture.recognize(image: capture.image)
+                    try Task.checkCancellation()
+                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .skipped("No readable text · skipped") }
+                    let textHash = JournalCapture.textFingerprint(text, context: context)
+                    guard !previous.hasText(textHash) else { return .skipped("Unchanged text · skipped") }
+                    return .captured(capture.capturedAt, imageHash, textHash, "Window: \(String(capture.title.prefix(160)))\n\(text)")
+                }
+                let sample = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
+                guard session.accepts(token) else { throw CancellationError() }
+                if case let .captured(capturedAt, imageHash, textHash, evidence) = sample {
+                    // A focus change during capture discards the sample instead of describing the wrong app.
+                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+                        status = "App changed · skipped"
+                        captureTask = nil
+                        return
+                    }
+                    let index = try await store.save(capturedAt: capturedAt, appName: name)
+                    pending = index
+                    guard session.accepts(token) else { throw CancellationError() }
+                    publish(index)
+                    status = "Summarizing locally"
+                    try await runtime.start()
+                    let result = try await JournalLocalModel.summarize(app: name, observations: evidence)
+                    guard session.accepts(token) else { throw CancellationError() }
+                    let inference = RawInference(status: "complete", completedAt: Date(), summary: result.summary,
+                                                 category: result.category, confidence: result.confidence,
+                                                 modelInputCharacterLimit: JournalPolicy.maximumInputCharacters, inputMode: "ocr")
+                    publish(try await store.saveInference(inference, index: index))
+                    pending = nil
+                    deduplicator.remember(image: imageHash, text: textHash)
+                    status = "Journal running · model released between summaries"
+                } else if case let .skipped(reason) = sample { status = reason }
+            } catch {
+                let cancelled = Task.isCancelled || !session.accepts(token)
+                if let index = pending {
+                    do {
+                        let inference = RawInference(status: cancelled ? "interrupted" : "failed", completedAt: Date(),
+                                                     error: cancelled ? "Journal stopped; source discarded." : "Local summary unavailable; source discarded.")
+                        publish(try await store.saveInference(inference, index: index))
+                    } catch { failStorage() }
+                }
+                if !cancelled, enabled {
+                    if let failure = error as? JournalModelRuntime.Failure { status = failure.localizedDescription }
+                    else { status = "Summary unavailable; retrying at the next interval" }
+                }
+            }
+            await runtime.finish()
+            captureTask = nil
         }
     }
 
     func revealCapture(_ index: RawCaptureIndex) {
-        Task {
-            if let folder = try? await store.folder(index) { NSWorkspace.shared.activateFileViewerSelecting([folder]) }
-        }
+        Task { if let folder = try? await store.folder(index) { NSWorkspace.shared.activateFileViewerSelecting([folder]) } }
     }
 
     func revealStorage() { NSWorkspace.shared.open(root) }
@@ -256,7 +237,7 @@ final class ActivityJournal: ObservableObject {
             defer { exporting = false }
             do {
                 let text = try await store.summaryText(day: selected)
-                guard !text.isEmpty else { status = "No completed LLM summaries for this day"; return }
+                guard !text.isEmpty else { status = "No completed summaries for this day"; return }
                 NSPasteboard.general.clearContents()
                 guard NSPasteboard.general.setString(text, forType: .string) else { throw CocoaError(.fileWriteUnknown) }
                 status = "Copied summaries to clipboard"
@@ -267,11 +248,12 @@ final class ActivityJournal: ObservableObject {
     func showWindow() {
         if window == nil {
             let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 650), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-            panel.title = "Git for Work (Den)"
+            panel.title = "Activity Journal"
             panel.contentView = NSHostingView(rootView: ActivityJournalView(journal: self))
             panel.minSize = NSSize(width: 500, height: 420)
             panel.isReleasedWhenClosed = false
-            panel.center(); window = panel
+            panel.center()
+            window = panel
         }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

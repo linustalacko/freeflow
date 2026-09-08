@@ -121,7 +121,15 @@ actor RawCaptureStore {
 
     func list(day: String? = nil) throws -> [RawCaptureIndex] {
         guard FileManager.default.fileExists(atPath: root.path) else { return [] }
-        let days = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)
+        let days: [URL]
+        if let day {
+            guard day.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else { throw CocoaError(.fileReadInvalidFileName) }
+            let directory = root.appendingPathComponent(day)
+            guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+            days = [directory]
+        } else {
+            days = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)
+        }
         var result: [RawCaptureIndex] = []
         for directory in days where day == nil || directory.lastPathComponent == day {
             for folder in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: .skipsHiddenFiles) {
@@ -133,18 +141,22 @@ actor RawCaptureStore {
     }
 
     func save(_ record: RawObservation, model: String = JournalLocalModel.model) throws -> RawCaptureIndex {
-        let day = RawCaptureJSON.day(record.capturedAt)
+        try save(capturedAt: record.capturedAt, appName: record.appName, id: record.id, model: model)
+    }
+
+    func save(capturedAt: Date, appName: String, id: UUID = UUID(), model: String = JournalLocalModel.model) throws -> RawCaptureIndex {
+        let day = RawCaptureJSON.day(capturedAt)
         let directory = root.appendingPathComponent(day)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         if let values = try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
            let available = values.volumeAvailableCapacityForImportantUsage,
            available < 512 * 1024 * 1024 { throw CocoaError(.fileWriteOutOfSpace) }
-        let staging = directory.appendingPathComponent("." + record.id.uuidString)
-        let final = directory.appendingPathComponent(record.id.uuidString)
+        let staging = directory.appendingPathComponent("." + id.uuidString)
+        let final = directory.appendingPathComponent(id.uuidString)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: staging) }
-        let index = RawCaptureIndex(id: record.id, capturedAt: record.capturedAt, day: day, appName: record.appName, relativePath: "\(day)/\(record.id.uuidString)")
+        let index = RawCaptureIndex(id: id, capturedAt: capturedAt, day: day, appName: appName, relativePath: "\(day)/\(id.uuidString)")
         try RawCaptureJSON.write(RawInference(model: model, status: "pending"), to: staging.appendingPathComponent("inference.json"))
         try RawCaptureJSON.write(index, to: staging.appendingPathComponent("index.json"))
         try FileManager.default.moveItem(at: staging, to: final)
@@ -192,7 +204,7 @@ actor RawCaptureStore {
         offset.locale = Locale(identifier: "en_US_POSIX")
         offset.timeZone = timeZone
         offset.dateFormat = "XXXXX"
-        let entries = try list().filter {
+        let entries = try list(on: day, timeZone: timeZone).filter {
             calendar.isDate($0.capturedAt, inSameDayAs: day) && $0.inferenceStatus == "complete" &&
             !$0.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }.map { item in
@@ -204,9 +216,24 @@ actor RawCaptureStore {
         return Self.copyPrompt + "\n\n" + entries
     }
 
-    static let copyPrompt = """
-    Summarize what I worked on today, one very short easy to read dotpoint for each, broken by time. You will see timestamps + app name + summary
+    /// Read only nearby day folders, even after crossing timezones. History size
+    /// does not increase the memory or I/O needed to show or copy a single day.
+    func list(on day: Date, timeZone: TimeZone = .current) throws -> [RawCaptureIndex] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        var result: [RawCaptureIndex] = []
+        for offset in -2...2 {
+            let nearby = calendar.date(byAdding: .day, value: offset, to: day)!
+            result += try list(day: formatter.string(from: nearby)).filter { calendar.isDate($0.capturedAt, inSameDayAs: day) }
+        }
+        return result.sorted { $0.capturedAt < $1.capturedAt }
+    }
 
-    E.g. - worked on stories (2hrs)
+    static let copyPrompt = """
+    Summarize the work topics below in short, easy-to-read bullet points, grouped by time. These are occasional screen observations, not proof of completed actions or continuous work. Gaps can mean the journal was stopped, the computer was idle, or the screen was unchanged. Do not infer exact hours worked from the timestamps.
     """
 }

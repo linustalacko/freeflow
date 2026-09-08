@@ -2,37 +2,42 @@ import Foundation
 import AppKit
 
 enum ActivityJournalTests {
-    static func run() {
+    @MainActor static func run() {
         testCommitHistory()
-        // A template icon needs real alpha; an opaque background renders as a square.
-        let icon = NSBitmapImageRep(data: try! Data(contentsOf: URL(fileURLWithPath: "Resources/DenMenu.png")))!
-        TestSupport.expectEqual(icon.hasAlpha, true)
-        TestSupport.expectEqual(icon.colorAt(x: 0, y: 0)!.alphaComponent < 0.01, true)
-        let alphas = (0..<icon.pixelsHigh).flatMap { y in (0..<icon.pixelsWide).map { x in icon.colorAt(x: x, y: y)!.alphaComponent } }
-        TestSupport.expectEqual(alphas.contains { $0 > 0.9 }, true)
-        TestSupport.expectEqual(alphas.filter { $0 < 0.01 }.count > alphas.count / 3, true)
-
-        // Transport must attach the original image bytes, without falling back to text-only input.
-        let syntheticPNG = Data([137, 80, 78, 71, 13, 10, 26, 10])
-        let body = try! JournalLocalModel.requestBody(app: "Synthetic Editor", observations: "Window: Diagram", screenshotPNG: syntheticPNG)
+        let body = try! JournalLocalModel.requestBody(app: "Synthetic Editor", observations: "Investigating frame timing")
         let payload = try! JSONSerialization.jsonObject(with: body) as! [String: Any]
         let messages = payload["messages"] as! [[String: Any]]
-        TestSupport.expectEqual(messages.last?["images"] as? [String], [syntheticPNG.base64EncodedString()])
+        TestSupport.expectEqual(messages.contains { $0["images"] != nil }, false)
+        TestSupport.expectEqual(payload["model"] as? String, "qwen2.5:0.5b")
+        TestSupport.expectEqual(payload["keep_alive"] as? Int, 0)
         TestSupport.expectEqual(payload["think"] as? Bool, false)
-        let ocrBody = try! JournalLocalModel.requestBody(app: "Editor", observations: "OCR: Investigating frame timing", screenshotPNG: syntheticPNG, mode: .ocr)
-        let ocrPayload = try! JSONSerialization.jsonObject(with: ocrBody) as! [String: Any]
-        let ocrMessages = ocrPayload["messages"] as! [[String: Any]]
-        TestSupport.expectEqual(ocrPayload["model"] as? String, "qwen2.5:3b")
-        TestSupport.expectEqual(ocrMessages.contains { $0["images"] != nil }, false)
-        TestSupport.expectEqual((ocrMessages.last?["content"] as? String)?.contains("Investigating frame timing"), true)
-        TestSupport.expectEqual(payload["model"] as? String, "qwen3.5:9b")
-        TestSupport.expectEqual((try? JournalLocalModel.requestBody(app: "Editor", observations: "", screenshotPNG: Data())) == nil, true)
+        let options = payload["options"] as! [String: Int]
+        TestSupport.expectEqual(options["num_ctx"], 2048)
+        TestSupport.expectEqual(options["num_predict"], 160)
+        TestSupport.expectEqual(options["num_thread"], 2)
+        let large = try! JournalLocalModel.requestBody(app: "Editor", observations: String(repeating: "x", count: 2400) + "MUST_NOT_BE_SENT")
+        TestSupport.expectEqual(String(data: large, encoding: .utf8)!.contains("MUST_NOT_BE_SENT"), false)
+        let unicode = JournalPolicy.boundedText(String(repeating: "界", count: 2400))
+        TestSupport.expectEqual(unicode.utf8.count, 1200)
+        TestSupport.expectEqual(unicode.contains("�"), false)
+        TestSupport.expectEqual(JournalCore.captureInterval(0), 180)
+        TestSupport.expectEqual(JournalCore.captureInterval(7), 60)
+        TestSupport.expectEqual(JournalCore.captureInterval(240), 240)
+        TestSupport.expectEqual(JournalCore.captureInterval(1000), 900)
+        TestSupport.expectEqual(JournalCore.captureInterval(.nan), 180)
+        let size = JournalPolicy.imageSize(width: 5120, height: 2880)
+        TestSupport.expectEqual(size.width, 1280)
+        TestSupport.expectEqual(size.height, 720)
+        TestSupport.expectEqual(JournalPolicy.imageSize(width: 640, height: 480).width, 640)
+        TestSupport.expectEqual(JournalCapture.isPrivate("Synthetic Incognito window"), true)
+        TestSupport.expectEqual(JournalCapture.isPrivate("Synthetic notes"), false)
+        TestSupport.expectEqual(JournalCapture.textFingerprint("frame   timing", context: "1"), JournalCapture.textFingerprint("frame timing", context: "1"))
+        TestSupport.expect(JournalCapture.textFingerprint("frame timing", context: "1") != JournalCapture.textFingerprint("frame timing", context: "2"), "Another window must be eligible")
+        let env = JournalModelRuntime.environment(home: "/synthetic/home")
+        TestSupport.expectEqual(env["OLLAMA_NO_CLOUD"], "1")
+        TestSupport.expectEqual(env["OLLAMA_KEEP_ALIVE"], "0")
+        TestSupport.expectEqual(env["OLLAMA_HOST"], "127.0.0.1:11436")
 
-        TestSupport.expectEqual(JournalCore.captureInterval(0), 60)
-        TestSupport.expectEqual(JournalCore.captureInterval(7), 7)
-        TestSupport.expectEqual(JournalCore.captureInterval(2), 5)
-        TestSupport.expectEqual(JournalCore.captureInterval(900), 300)
-        TestSupport.expectEqual(JournalCore.captureInterval(.nan), 60)
         let start = Date(timeIntervalSince1970: 1000)
         // A recent mouse/key event must count even if no CG null event has occurred.
         let recentInput = JournalCapture.idleSeconds { _, type in type.rawValue == UInt32.max ? 3 : 3600 }

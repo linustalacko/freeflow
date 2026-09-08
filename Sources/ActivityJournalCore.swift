@@ -28,7 +28,7 @@ struct JournalArchive: Codable {
 
 enum JournalCore {
     static func captureInterval(_ seconds: Double) -> Double {
-        seconds.isFinite && seconds > 0 ? min(300, max(5, seconds.rounded())) : 60
+        seconds.isFinite && seconds > 0 ? min(JournalPolicy.maximumInterval, max(JournalPolicy.minimumInterval, seconds.rounded())) : JournalPolicy.defaultInterval
     }
 
     static func commitHistory(_ entries: [JournalEntry], day: Date, calendar: Calendar = .current) -> String {

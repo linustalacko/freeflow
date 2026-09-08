@@ -56,6 +56,14 @@ enum RawCaptureStoreTests {
             _ = try await store.saveInference(RawInference(status: "failed", summary: "Not a completed summary"), index: index)
             let failed = try await store.summaryText(day: stamp, timeZone: zone)
             TestSupport.expectEqual(failed, "")
+            // A distant broken history entry must not be read while opening/copying this day.
+            let distant = root.appendingPathComponent("2001-01-01/broken-entry")
+            try FileManager.default.createDirectory(at: distant, withIntermediateDirectories: true)
+            try Data("invalid synthetic index".utf8).write(to: distant.appendingPathComponent("index.json"))
+            let nearby = try await store.list(on: stamp, timeZone: zone)
+            TestSupport.expectEqual(nearby.count, 1)
+            let distantIgnored = try await store.summaryText(day: stamp, timeZone: zone)
+            TestSupport.expectEqual(distantIgnored, "")
             // Test pasteboard round-trip without reading or replacing the user's clipboard.
             let pasteboard = NSPasteboard.withUniqueName()
             defer { pasteboard.releaseGlobally() }

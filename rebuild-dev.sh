@@ -1,42 +1,51 @@
 #!/usr/bin/env bash
-# Build/install at a fixed path with a remembered signing identity. Never silently
-# fall back to ad-hoc signing: that can invalidate macOS privacy grants.
+# Rebuild FreeFlow (dev), ad-hoc sign it, and relaunch — in one command.
+# Use this after any code change. `make run` doesn't work here because the
+# Makefile's codesign step wants a "FreeFlow Dev" identity that doesn't exist;
+# Apple Silicon auto-ad-hoc-signs the binary, so we just ad-hoc sign the bundle
+# and run it.
 set -euo pipefail
 cd "$(dirname "$0")"
-identity_file="$(git rev-parse --git-path freeflow-signing-identity)"
-identity="${CODESIGN_IDENTITY:-}"
-if [ -z "$identity" ] && [ -f "$identity_file" ]; then identity="$(cat "$identity_file")"; fi
-if [ -z "$identity" ]; then
-  identity="$(security find-identity -v -p codesigning | awk '/Developer ID Application/ {print $2; exit}')"
+APP="build/FreeFlow Dev.app"
+
+echo "==> building (arm64)…"
+# The codesign step inside `make` will fail (no 'FreeFlow Dev' identity) — that's
+# expected and harmless; the swiftc build already produced the binary.
+make ARCH=arm64 >/tmp/freeflow-build.log 2>&1 || true
+if ! grep -q "FreeFlow Dev" "build/FreeFlow Dev.app/Contents/MacOS/FreeFlow Dev" 2>/dev/null \
+   && [ ! -f "build/FreeFlow Dev.app/Contents/MacOS/FreeFlow Dev" ]; then
+  echo "build failed — see /tmp/freeflow-build.log"; tail -20 /tmp/freeflow-build.log; exit 1
 fi
-if [ -z "$identity" ] || [ "$identity" = '-' ]; then
-  echo 'A stable Developer ID signing identity is required. No ad-hoc fallback was used.' >&2
-  exit 1
+if grep -qiE "error:" /tmp/freeflow-build.log; then
+  echo "COMPILE ERRORS:"; grep -iE "error:" /tmp/freeflow-build.log | head; exit 1
 fi
-printf '%s\n' "$identity" > "$identity_file"
-make ARCH="$(uname -m)" CODESIGN_IDENTITY="$identity"
-# Re-sign even when make did not rebuild an existing ad-hoc bundle.
-codesign --force --options runtime --sign "$identity" --entitlements FreeFlow.entitlements 'build/FreeFlow Dev.app'
-codesign --verify --deep --strict 'build/FreeFlow Dev.app'
-ditto 'build/FreeFlow Dev.app' '/Applications/FreeFlow Journal-staging.app'
-python3 - <<'PY'
-import pathlib, subprocess, os, signal, time
-result = subprocess.run(['pgrep', '-f', r'^/Applications/FreeFlow Dev\.app/Contents/MacOS/FreeFlow Dev'], capture_output=True, text=True)
-if result.returncode not in (0, 1): raise RuntimeError('Could not identify the running app')
-for raw in result.stdout.split():
-    pid = int(raw)
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(50):
-        try: os.kill(pid, 0)
-        except ProcessLookupError: break
-        time.sleep(0.1)
-    else: raise RuntimeError('App is still running; installation stopped')
-installed = pathlib.Path('/Applications/FreeFlow Dev.app')
-if installed.exists():
-    trash = pathlib.Path.home() / '.Trash'
-    trash.mkdir(exist_ok=True)
-    installed.rename(trash / ('FreeFlow Dev-before-update-' + str(time.time_ns()) + '.app'))
-pathlib.Path('/Applications/FreeFlow Journal-staging.app').rename(installed)
-PY
-open -a '/Applications/FreeFlow Dev.app' --args --activity-journal
-echo 'Installed with stable signing. macOS may require a grant when changing from the old ad-hoc identity.'
+
+echo "==> signing…"
+# Sign with your stable Apple Development cert so macOS keeps the app's
+# Accessibility/Input-Monitoring/Mic grants across rebuilds. Ad-hoc signing
+# changes the signature every build and silently drops those permissions
+# (which makes the app feel "not running" — the hotkey goes dead).
+DEV_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | head -1 | awk '{print $2}')
+if [ -n "$DEV_ID" ]; then
+  codesign --force --deep --sign "$DEV_ID" --entitlements FreeFlow.entitlements "$APP" >/dev/null 2>&1 \
+    && echo "    signed (stable dev cert ${DEV_ID:0:10}…) — permissions persist"
+else
+  echo "    no Apple Development cert — falling back to ad-hoc (permissions reset each rebuild)"
+  codesign --force --deep --sign - --entitlements FreeFlow.entitlements "$APP" >/dev/null 2>&1
+fi
+codesign --verify "$APP" && echo "    signature OK"
+
+echo "==> relaunching…"
+pkill -f "FreeFlow Dev.app/Contents/MacOS/FreeFlow Dev" 2>/dev/null || true
+for _ in 1 2 3 4; do pgrep -f "FreeFlow Dev.app/Contents/MacOS" >/dev/null || break; sleep 1; done
+# Relaunch via the login agent if installed (reliable GUI session), else plain open.
+AGENT="gui/$(id -u)/com.freeflow.dev.autostart"
+if launchctl print "$AGENT" >/dev/null 2>&1; then
+  launchctl kickstart -k "$AGENT"
+else
+  open "$APP"
+fi
+echo "==> done. If the hotkey / typing / mic stop working, re-grant permissions"
+echo "    (System Settings ▸ Privacy & Security ▸ Accessibility / Microphone /"
+echo "     Input Monitoring) — ad-hoc rebuilds change the signature and macOS"
+echo "     sometimes drops the grants."

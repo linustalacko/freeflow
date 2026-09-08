@@ -1,9 +1,9 @@
 import SwiftUI
 
 struct MenuBarView: View {
+    @ObservedObject private var journal = ActivityJournal.shared
     @EnvironmentObject var appState: AppState
     @ObservedObject private var updateManager = UpdateManager.shared
-    @ObservedObject private var journal = ActivityJournal.shared
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -113,10 +113,17 @@ struct MenuBarView: View {
 
             Divider()
 
-            // Manual toggle
-            Button("Git for Work (Den)") { journal.showWindow() }
+            Menu(journal.enabled ? "Activity Journal · Running" : "Activity Journal") {
+                Button("Open Journal…") { journal.showWindow() }
+                Button(journal.enabled ? "Stop Journal" : "Start Journal") {
+                    if journal.enabled { journal.stop() } else { journal.start() }
+                }
+                Button("Copy Today’s Summaries") { journal.export() }.disabled(journal.exporting)
+            }
+
             Divider()
 
+            // Manual toggle
             Button(appState.isRecording ? "Stop Recording" : "Start Dictating") {
                 appState.toggleRecording()
             }
@@ -430,19 +437,5 @@ struct MenuBarView: View {
             .keyboardShortcut("q")
         }
         .padding(4)
-    }
-}
-
-struct DenMenuBarView: View {
-    @EnvironmentObject var appState: AppState
-    @ObservedObject private var journal = ActivityJournal.shared
-
-    var body: some View {
-        Button(journal.exporting ? "Copying…" : "Copy today’s commits") { journal.export() }.disabled(journal.exporting)
-        Text("\(journal.todayCount) screenshots taken today")
-        Button("Git for Work (Den)") { journal.showWindow() }
-        Divider()
-        Menu("Dictation") { MenuBarView().environmentObject(appState) }
-        Button("Quit") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
     }
 }
