@@ -3,6 +3,9 @@ import Foundation
 @main
 struct FreeFlowTests {
     static func main() async {
+        ActivityJournalTests.run()
+        await JournalLifecycleTests.run()
+        await RawCaptureStoreTests.run()
         AppContextServiceTests.run()
         DictationProfileTests.run()
         ModelConfigurationTests.run()

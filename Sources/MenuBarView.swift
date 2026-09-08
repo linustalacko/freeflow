@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct MenuBarView: View {
+    @ObservedObject private var journal = ActivityJournal.shared
     @EnvironmentObject var appState: AppState
     @ObservedObject private var updateManager = UpdateManager.shared
 
@@ -108,6 +109,16 @@ struct MenuBarView: View {
                     .font(.caption)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 6)
+            }
+
+            Divider()
+
+            Menu(journal.enabled ? "Activity Journal · Running" : "Activity Journal") {
+                Button("Open Journal…") { journal.showWindow() }
+                Button(journal.enabled ? "Stop Journal" : "Start Journal") {
+                    if journal.enabled { journal.stop() } else { journal.start() }
+                }
+                Button("Copy Today’s Summaries") { journal.export() }.disabled(journal.exporting)
             }
 
             Divider()

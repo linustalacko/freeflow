@@ -7,6 +7,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NetworkMonitor.shared.start()
+        // Opening the optional journal never starts capture. Each session needs Start.
+        if CommandLine.arguments.contains("--activity-journal") { ActivityJournal.shared.showWindow() }
 
         NotificationCenter.default.addObserver(
             self,
@@ -35,6 +37,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        ActivityJournal.shared.shutdown()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
