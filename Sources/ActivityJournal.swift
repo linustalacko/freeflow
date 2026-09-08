@@ -13,6 +13,9 @@ final class ActivityJournal: ObservableObject {
     var enabled: Bool { session.enabled }
     @Published private(set) var records: [RawCaptureIndex] = []
     @Published private(set) var status = "Stopped"
+    @Published private(set) var lastCheckAt: Date?
+    @Published private(set) var nextCheckAt: Date?
+    @Published private(set) var actionMessage: String?
     @Published private(set) var storageError: String?
     @Published private(set) var exporting = false
     @Published private(set) var captureInterval = JournalCore.captureInterval(UserDefaults.standard.double(forKey: "journal_lightweight_interval"))
@@ -25,6 +28,7 @@ final class ActivityJournal: ObservableObject {
     private var selectedDay = Date()
     private var viewGeneration = UUID()
     private var timer: Timer?
+    private var firstCaptureTimer: Timer?
     private var suspended = false
     private var observers: [NSObjectProtocol] = []
     private var captureTask: Task<Void, Never>?
@@ -43,9 +47,19 @@ final class ActivityJournal: ObservableObject {
         guard CGPreflightScreenCaptureAccess() else { status = "Screen Recording permission required"; showWindow(); return }
         guard JournalModelRuntime.executable != nil else { status = JournalModelRuntime.Failure.notInstalled.localizedDescription; showWindow(); return }
         session.setEnabled(true)
+        actionMessage = nil
         deduplicator.reset()
         suspended = false
         let center = NSWorkspace.shared.notificationCenter
+        observers.append(center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                let eligible = app.bundleIdentifier != Bundle.main.bundleIdentifier &&
+                    !JournalCore.excluded(bundleID: app.bundleIdentifier ?? "", name: app.localizedName ?? "", custom: self.excludedApps)
+                if self.session.shouldRetryOnActivation(isEligible: eligible) { self.scheduleFirstCapture() }
+            }
+        })
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
@@ -72,6 +86,9 @@ final class ActivityJournal: ObservableObject {
         session.setEnabled(false)
         timer?.invalidate()
         timer = nil
+        firstCaptureTimer?.invalidate()
+        firstCaptureTimer = nil
+        nextCheckAt = nil
         for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         observers.removeAll()
         captureTask?.cancel()
@@ -89,7 +106,9 @@ final class ActivityJournal: ObservableObject {
         Task {
             do {
                 let items = try await store.list(on: day)
-                if viewGeneration == token { records = items }
+                if viewGeneration == token {
+                    records = items
+                }
             } catch { storageError = "Could not read summaries. Existing data has been preserved." }
         }
     }
@@ -104,10 +123,33 @@ final class ActivityJournal: ObservableObject {
         timer?.invalidate()
         timer = nil
         guard enabled, storageError == nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: captureInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.capture() }
+        nextCheckAt = Date().addingTimeInterval(captureInterval)
+        let timer = Timer(timeInterval: captureInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.enabled else { return }
+                self.nextCheckAt = Date().addingTimeInterval(self.captureInterval)
+                self.capture()
+            }
         }
-        timer?.tolerance = min(15, captureInterval * 0.1)
+        timer.tolerance = min(15, captureInterval * 0.1)
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func scheduleFirstCapture() {
+        firstCaptureTimer?.invalidate()
+        let token = session.generation
+        let timer = Timer(timeInterval: 1, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.session.accepts(token), self.session.awaitingFirstApp else { return }
+                self.firstCaptureTimer = nil
+                self.configureTimer()
+                self.capture()
+            }
+        }
+        nextCheckAt = Date().addingTimeInterval(1)
+        RunLoop.main.add(timer, forMode: .common)
+        firstCaptureTimer = timer
     }
 
     func requestCapturePermission() {
@@ -136,8 +178,11 @@ final class ActivityJournal: ObservableObject {
 
     private func capture() {
         guard enabled, storageError == nil else { return }
+        lastCheckAt = Date()
+        actionMessage = nil
         let idle = JournalCapture.idleSeconds()
-        guard session.canCapture(busy: captureTask != nil, suspended: suspended, idleSeconds: idle) else {
+        guard session.canCapture(busy: captureTask != nil, suspended: suspended, idleSeconds: idle,
+                                 activityWindow: JournalPolicy.activityWindow(interval: captureInterval)) else {
             if captureTask == nil { status = suspended ? "Asleep · no screenshots" : "Idle · no screenshots" }
             return
         }
@@ -147,8 +192,9 @@ final class ActivityJournal: ObservableObject {
         guard CGPreflightScreenCaptureAccess() else { stop(); status = "Screen Recording permission required"; return }
         guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier != Bundle.main.bundleIdentifier,
               !JournalCore.excluded(bundleID: app.bundleIdentifier ?? "", name: app.localizedName ?? "", custom: excludedApps) else {
-            status = "Excluded app · no screenshots"; return
+            status = session.awaitingFirstApp ? "Switch to a work app to begin" : "Excluded app · no screenshots"; return
         }
+        session.didBeginCapture()
         let token = session.generation
         let pid = app.processIdentifier
         let name = app.localizedName ?? "Unknown app"
@@ -237,11 +283,11 @@ final class ActivityJournal: ObservableObject {
             defer { exporting = false }
             do {
                 let text = try await store.summaryText(day: selected)
-                guard !text.isEmpty else { status = "No completed summaries for this day"; return }
+                guard !text.isEmpty else { actionMessage = "No completed summaries for this day"; return }
                 NSPasteboard.general.clearContents()
                 guard NSPasteboard.general.setString(text, forType: .string) else { throw CocoaError(.fileWriteUnknown) }
-                status = "Copied summaries to clipboard"
-            } catch { status = "Could not copy summaries. Please try again." }
+                actionMessage = "Copied summaries to clipboard"
+            } catch { actionMessage = "Could not copy summaries. Please try again." }
         }
     }
 

@@ -4,6 +4,8 @@ import AppKit
 enum ActivityJournalTests {
     @MainActor static func run() {
         testCommitHistory()
+        testSmallTextCapture()
+        testForegroundWindow()
         let body = try! JournalLocalModel.requestBody(app: "Synthetic Editor", observations: "Investigating frame timing")
         let payload = try! JSONSerialization.jsonObject(with: body) as! [String: Any]
         let messages = payload["messages"] as! [[String: Any]]
@@ -26,8 +28,8 @@ enum ActivityJournalTests {
         TestSupport.expectEqual(JournalCore.captureInterval(1000), 900)
         TestSupport.expectEqual(JournalCore.captureInterval(.nan), 180)
         let size = JournalPolicy.imageSize(width: 5120, height: 2880)
-        TestSupport.expectEqual(size.width, 1280)
-        TestSupport.expectEqual(size.height, 720)
+        TestSupport.expectEqual(size.width, 1920)
+        TestSupport.expectEqual(size.height, 1080)
         TestSupport.expectEqual(JournalPolicy.imageSize(width: 640, height: 480).width, 640)
         TestSupport.expectEqual(JournalCapture.isPrivate("Synthetic Incognito window"), true)
         TestSupport.expectEqual(JournalCapture.isPrivate("Synthetic notes"), false)
@@ -85,6 +87,56 @@ enum ActivityJournalTests {
             try Data("invalid archive".utf8).write(to: store.url)
             TestSupport.expectEqual((try? store.load()) == nil, true)
         } catch { fatalError("Synthetic journal persistence test failed: \(error)") }
+    }
+
+    private static func testForegroundWindow() {
+        func window(_ id: UInt32, pid: Int = 42, height: Double, alpha: Double = 1, title: String = "Synthetic notes") -> [String: Any] {
+            [kCGWindowNumber as String: id, kCGWindowOwnerPID as String: pid, kCGWindowLayer as String: 0,
+             kCGWindowBounds as String: ["Width": 1728.0, "Height": height],
+             kCGWindowAlpha as String: alpha, kCGWindowName as String: title]
+        }
+        let strip = window(1, height: 32)
+        let content = window(2, height: 1084)
+        let hidden = window(3, height: 1084, alpha: 0)
+        let otherApp = window(4, pid: 99, height: 1084)
+        let selected = JournalCapture.foregroundWindow(in: [strip, hidden, otherApp, content], pid: 42)
+        TestSupport.expectEqual(selected?[kCGWindowNumber as String] as? UInt32, 2)
+        TestSupport.expectEqual(JournalCapture.foregroundWindow(in: [strip, hidden, otherApp], pid: 42) == nil, true)
+        // A private front window is selected and rejected by the privacy guard;
+        // it must not fall through to a public background window.
+        let privateWindow = window(5, height: 1084, title: "Synthetic private browsing")
+        let front = JournalCapture.foregroundWindow(in: [strip, privateWindow, content], pid: 42)
+        TestSupport.expectEqual(front?[kCGWindowNumber as String] as? UInt32, 5)
+        TestSupport.expectEqual(JournalCapture.isPrivate(front?[kCGWindowName as String] as? String ?? ""), true)
+    }
+
+    @MainActor private static func testSmallTextCapture() {
+        // A 1920-point window at Retina scale with ordinary 14-point body text.
+        // The former 1280-pixel cap retained only the heading in this fixture.
+        let size = JournalPolicy.imageSize(width: 3840, height: 2160)
+        for dark in [false, true] {
+            let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: size.width, pixelsHigh: size.height,
+                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                          colorSpaceName: .deviceRGB, bytesPerRow: size.width * 4, bitsPerPixel: 32)!
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+            (dark ? NSColor.black : NSColor.white).setFill()
+            NSRect(x: 0, y: 0, width: size.width, height: size.height).fill()
+            let text = """
+            OFFLINE CACHE INVESTIGATION
+            Reviewing cache eviction behavior for offline downloads.
+            Recently opened files should stay available without a connection.
+            Comparing access timestamps and least-recently-used ordering.
+            The next test simulates a full cache and verifies eviction order.
+            """
+            (text as NSString).draw(in: NSRect(x: 24, y: size.height - 230, width: size.width - 48, height: 200),
+                                   withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 28 * Double(size.width) / 3840, weight: .regular),
+                                                    .foregroundColor: dark ? NSColor.white : NSColor.black])
+            NSGraphicsContext.restoreGraphicsState()
+            let recognized = (try? JournalCapture.recognize(image: bitmap.cgImage!)) ?? ""
+            TestSupport.expect(recognized.count > 180 && recognized.lowercased().contains("eviction"),
+                               "Fast OCR must retain ordinary body text after resizing, in both appearances")
+        }
     }
 
     private static func testCommitHistory() {

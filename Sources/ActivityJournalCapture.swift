@@ -20,13 +20,25 @@ enum JournalCapture {
         return ["incognito", "private browsing", "inprivate"].contains { lower.contains($0) }
     }
 
+    static func foregroundWindow(in windows: [[String: Any]], pid: pid_t) -> [String: Any]? {
+        // Some apps put a separate title/toolbar strip ahead of their content
+        // window. Preserve front-to-back order among usable content windows.
+        windows.first { window in
+            guard (window[kCGWindowOwnerPID as String] as? Int) == Int(pid),
+                  (window[kCGWindowLayer as String] as? Int) == 0,
+                  let bounds = window[kCGWindowBounds as String] as? [String: Double],
+                  let width = bounds["Width"], let height = bounds["Height"],
+                  width.isFinite, height.isFinite, width >= 120, height >= 80 else { return false }
+            return (window[kCGWindowAlpha as String] as? Double ?? 1) > 0
+        }
+    }
+
     static func captureWindow(pid: pid_t) async throws -> WindowCapture? {
         try Task.checkCancellation()
         guard CGPreflightScreenCaptureAccess(),
               let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
-              let window = windows.first(where: {
-                  ($0[kCGWindowOwnerPID as String] as? Int) == Int(pid) && ($0[kCGWindowLayer as String] as? Int) == 0
-              }), let number = window[kCGWindowNumber as String] as? UInt32 else { return nil }
+              let window = foregroundWindow(in: windows, pid: pid),
+              let number = window[kCGWindowNumber as String] as? UInt32 else { return nil }
         var title = window[kCGWindowName as String] as? String ?? ""
         guard !isPrivate(title) else { return nil }
         let image: CGImage

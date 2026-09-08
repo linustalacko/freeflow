@@ -57,6 +57,15 @@ struct ActivityJournalView: View {
                 }.padding(.horizontal, 20)
             }
             Divider()
+            HStack(spacing: 16) {
+                if let checked = journal.lastCheckAt {
+                    HStack(spacing: 4) { Text("Last check"); Text(checked.formatted(date: .omitted, time: .standard)).accessibilityIdentifier("journal.lastCheck") }
+                }
+                if journal.enabled, let next = journal.nextCheckAt {
+                    HStack(spacing: 4) { Text("Next check"); Text(next.formatted(date: .omitted, time: .standard)).accessibilityIdentifier("journal.nextCheck") }
+                }
+                Spacer()
+            }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.top, 10)
             HStack {
                 Text(journal.storageError ?? journal.status).lineLimit(2).accessibilityIdentifier("journal.status")
                 if journal.status == "Screen Recording permission required" {
@@ -65,6 +74,9 @@ struct ActivityJournalView: View {
                 Spacer()
                 Label("On this Mac", systemImage: "lock").fixedSize()
             }.font(.caption).foregroundStyle(.secondary).padding(12)
+            if let message = journal.actionMessage {
+                Text(message).font(.caption).foregroundStyle(.secondary).padding(.bottom, 10)
+            }
         }
         .onAppear { journal.showDay(day) }
         .onChange(of: day) { value in journal.showDay(value) }

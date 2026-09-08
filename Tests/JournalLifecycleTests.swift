@@ -8,12 +8,26 @@ enum JournalLifecycleTests {
         session.setEnabled(true)
         let first = session.generation
         TestSupport.expectEqual(session.canCapture(busy: false, suspended: false, idleSeconds: 0), true)
+        TestSupport.expectEqual(session.shouldRetryOnActivation(isEligible: false), false)
+        TestSupport.expectEqual(session.shouldRetryOnActivation(isEligible: true), true)
+        // Explicit Start should work even after a long reading/idle period.
+        TestSupport.expectEqual(session.canCapture(busy: false, suspended: false, idleSeconds: 600), true)
+        TestSupport.expectEqual(session.canCapture(busy: true, suspended: false, idleSeconds: 600), false)
+        TestSupport.expectEqual(session.canCapture(busy: false, suspended: true, idleSeconds: 600), false)
+        TestSupport.expectEqual(session.canCapture(busy: false, suspended: false, idleSeconds: .infinity), false)
+        session.didBeginCapture()
+        TestSupport.expectEqual(session.shouldRetryOnActivation(isEligible: true), false)
         TestSupport.expectEqual(session.canCapture(busy: true, suspended: false, idleSeconds: 0), false)
         TestSupport.expectEqual(session.canCapture(busy: false, suspended: true, idleSeconds: 0), false)
         for idle in [120.0, 3600, .infinity, .nan, -1] {
             TestSupport.expectEqual(session.canCapture(busy: false, suspended: false, idleSeconds: idle), false)
         }
+        // Input in the first minute of a three-minute interval must not disappear.
+        let window = JournalPolicy.activityWindow(interval: 180)
+        TestSupport.expectEqual(session.canCapture(busy: false, suspended: false, idleSeconds: 150, activityWindow: window), true)
+        TestSupport.expectEqual(session.canCapture(busy: false, suspended: false, idleSeconds: 196, activityWindow: window), false)
         session.setEnabled(false)
+        TestSupport.expectEqual(session.shouldRetryOnActivation(isEligible: true), false)
         TestSupport.expectEqual(session.accepts(first), false)
         session.setEnabled(true)
         TestSupport.expectEqual(session.accepts(first), false)

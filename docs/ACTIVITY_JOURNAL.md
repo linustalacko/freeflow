@@ -3,7 +3,10 @@
 FreeFlow → Activity Journal → **Start Journal** starts a session.
 **Stop Journal** stops capture and cancels current work. **Open Journal…** shows
 saved summaries without starting capture. Every app launch starts stopped,
-including launches with `--activity-journal`.
+including launches with `--activity-journal`. After Start, switching from the
+journal to a work app triggers the first check after a one-second settling delay.
+The footer shows the last and next check times and the current processing or
+skip reason; copying summaries does not replace that status.
 The normal FreeFlow menu, branding, dictation shortcuts, settings and provider
 choices remain intact. This feature does not start at login.
 
@@ -29,9 +32,13 @@ error; there is no automatic download or remote fallback.
 
 - Checks every 180 seconds by default; configurable from 60–900 seconds.
   Longer intervals use less energy and can miss short tasks.
-- Skips sleep, lock, two minutes of inactivity, excluded/private windows, and
-  busy processing before taking another screenshot. There is no image queue.
-- Captures only the active app's window, at most 1280 pixels on its longest
+- Skips sleep, lock, excluded/private windows, and busy processing before
+  taking another screenshot. After the initial check, inactivity is measured
+  against the whole check interval plus timer tolerance (195 seconds at the
+  default interval), with a minimum two-minute window. This avoids losing
+  activity between checks. There is no image queue. App switches trigger an
+  extra check only while waiting for the first work app after Start.
+- Captures only the active app's window, at most 1920 pixels on its longest
   edge. Screenshots are passed straight to Apple's fast OCR; no PNG encoding,
   compression or decoding round-trip.
 - Compares a 64×64 thumbnail hash before OCR and a normalized text hash before
@@ -98,10 +105,44 @@ was absent afterward and after Stop. Only status/count metadata and synthetic
 content were inspected. No raw source files were retained. Test entries and the
 test application were removed afterward.
 
+Follow-up capture fix: some real apps expose a separate 32-pixel-high toolbar
+window ahead of the content window. Selecting it yielded no readable text.
+Window selection now skips thin and transparent windows, preserving front-to-
+back order among usable content windows. A selected private window is still
+rejected; it never falls through to a public background window.
+
+The original lightweight timer could miss activity in
+the first minute of each interval, and Start from the journal itself skipped
+the first sample. The activity window now covers the interval and coalescing;
+a one-time app-activation retry starts capture when the user switches to work.
+A 1920-point synthetic window with 14-point text lost its body text at the
+1280-pixel cap. At 1600 pixels it retained text with recognition errors; the
+1920-pixel cap passes body-text checks in light and dark appearances. Fast OCR
+of these synthetic images took about 0.01–0.02 seconds after first use. This
+raises transient image memory, while keeping the same small model and cadence.
+
+Follow-up manual verification used the signed app at its existing install path
+with existing permissions. Start from the journal showed the switch-to-work
+prompt; a large invented work window then produced a completed local summary.
+A subsequent scheduled check produced another summary without another Start.
+The default three-minute timer was observed firing; the successful continuous
+capture test used the supported 60-second interval, then restored 180 seconds.
+The model service was absent after both successful samples; one between-sample
+app reading was 0.0% CPU and 99,376 KiB RSS. The footer showed
+check times and fixed skip/processing reasons. The final selector was also
+verified on a real app with a 1728×32 toolbar above its 1728×1084 content window:
+capture plus fast OCR took about 0.50 seconds and recognized 1,164 characters.
+Only dimensions, character counts and duration were inspected. The signed app
+then saved a new completed real-work entry; only its completion status and
+timestamp were checked, and the model service had exited. Test entries, images and the
+fixture app were removed. No real screen content was printed or exported.
+
 `make check` covers stopped-by-default sessions, idle/busy/sleep gates, stale
 session rejection, duplicate hashes, Unicode/input/resource bounds, runtime
 ownership and cancellation with a harmless subprocess and fake readiness,
-summary-only storage/migration, bounded day reads, and a private-pasteboard
+toolbar/transparent-window selection and private-window ordering, small body
+text through fast OCR, summary-only storage/migration, bounded day
+reads, and a private-pasteboard
 round-trip. It never calls an AI provider. The existing dictation/provider/
 shortcut tests also pass. No new live microphone-to-paste claim is made;
 dictation's implementation is unchanged.
