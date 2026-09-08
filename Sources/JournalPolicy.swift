@@ -5,12 +5,18 @@ enum JournalPolicy {
     static let minimumInterval = 60.0
     static let maximumInterval = 900.0
     static let idleLimit = 120.0
-    static let maximumImageDimension = 1280
+    static let maximumImageDimension = 1920
     static let maximumInputCharacters = 2400
     static let maximumInputBytes = 1200
     static let contextTokens = 2048
     static let outputTokens = 160
     static let model = "qwen2.5:0.5b"
+
+    static func activityWindow(interval: TimeInterval) -> TimeInterval {
+        // Include the whole sampling interval, including timer coalescing. A
+        // two-minute cutoff with a three-minute timer loses activity between checks.
+        max(idleLimit, interval + min(15, interval * 0.1))
+    }
 
     static func imageSize(width: Int, height: Int) -> (width: Int, height: Int) {
         guard width > 0, height > 0 else { return (1, 1) }
@@ -36,19 +42,25 @@ enum JournalPolicy {
 struct JournalSession {
     private(set) var enabled = false
     private(set) var generation = UUID()
+    private(set) var awaitingFirstApp = false
 
     mutating func setEnabled(_ value: Bool) {
         enabled = value
         generation = UUID()
+        awaitingFirstApp = value
     }
 
     mutating func invalidate() { generation = UUID() }
 
     func accepts(_ token: UUID) -> Bool { enabled && generation == token }
 
-    func canCapture(busy: Bool, suspended: Bool, idleSeconds: Double) -> Bool {
-        enabled && !busy && !suspended && idleSeconds.isFinite && idleSeconds >= 0 && idleSeconds < JournalPolicy.idleLimit
+    func canCapture(busy: Bool, suspended: Bool, idleSeconds: Double, activityWindow: Double = JournalPolicy.idleLimit) -> Bool {
+        enabled && !busy && !suspended && idleSeconds.isFinite && idleSeconds >= 0 &&
+            (awaitingFirstApp || idleSeconds < activityWindow)
     }
+
+    func shouldRetryOnActivation(isEligible: Bool) -> Bool { enabled && awaitingFirstApp && isEligible }
+    mutating func didBeginCapture() { awaitingFirstApp = false }
 }
 
 /// Only hashes survive between samples. Failed summaries are retried.
