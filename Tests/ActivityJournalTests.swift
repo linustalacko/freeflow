@@ -5,6 +5,7 @@ enum ActivityJournalTests {
     @MainActor static func run() {
         testCommitHistory()
         testSmallTextCapture()
+        testForegroundWindow()
         let body = try! JournalLocalModel.requestBody(app: "Synthetic Editor", observations: "Investigating frame timing")
         let payload = try! JSONSerialization.jsonObject(with: body) as! [String: Any]
         let messages = payload["messages"] as! [[String: Any]]
@@ -86,6 +87,27 @@ enum ActivityJournalTests {
             try Data("invalid archive".utf8).write(to: store.url)
             TestSupport.expectEqual((try? store.load()) == nil, true)
         } catch { fatalError("Synthetic journal persistence test failed: \(error)") }
+    }
+
+    private static func testForegroundWindow() {
+        func window(_ id: UInt32, pid: Int = 42, height: Double, alpha: Double = 1, title: String = "Synthetic notes") -> [String: Any] {
+            [kCGWindowNumber as String: id, kCGWindowOwnerPID as String: pid, kCGWindowLayer as String: 0,
+             kCGWindowBounds as String: ["Width": 1728.0, "Height": height],
+             kCGWindowAlpha as String: alpha, kCGWindowName as String: title]
+        }
+        let strip = window(1, height: 32)
+        let content = window(2, height: 1084)
+        let hidden = window(3, height: 1084, alpha: 0)
+        let otherApp = window(4, pid: 99, height: 1084)
+        let selected = JournalCapture.foregroundWindow(in: [strip, hidden, otherApp, content], pid: 42)
+        TestSupport.expectEqual(selected?[kCGWindowNumber as String] as? UInt32, 2)
+        TestSupport.expectEqual(JournalCapture.foregroundWindow(in: [strip, hidden, otherApp], pid: 42) == nil, true)
+        // A private front window is selected and rejected by the privacy guard;
+        // it must not fall through to a public background window.
+        let privateWindow = window(5, height: 1084, title: "Synthetic private browsing")
+        let front = JournalCapture.foregroundWindow(in: [strip, privateWindow, content], pid: 42)
+        TestSupport.expectEqual(front?[kCGWindowNumber as String] as? UInt32, 5)
+        TestSupport.expectEqual(JournalCapture.isPrivate(front?[kCGWindowName as String] as? String ?? ""), true)
     }
 
     @MainActor private static func testSmallTextCapture() {

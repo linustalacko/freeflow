@@ -105,7 +105,13 @@ was absent afterward and after Stop. Only status/count metadata and synthetic
 content were inspected. No raw source files were retained. Test entries and the
 test application were removed afterward.
 
-Follow-up capture fix: the original lightweight timer could miss activity in
+Follow-up capture fix: some real apps expose a separate 32-pixel-high toolbar
+window ahead of the content window. Selecting it yielded no readable text.
+Window selection now skips thin and transparent windows, preserving front-to-
+back order among usable content windows. A selected private window is still
+rejected; it never falls through to a public background window.
+
+The original lightweight timer could miss activity in
 the first minute of each interval, and Start from the journal itself skipped
 the first sample. The activity window now covers the interval and coalescing;
 a one-time app-activation retry starts capture when the user switches to work.
@@ -123,13 +129,19 @@ The default three-minute timer was observed firing; the successful continuous
 capture test used the supported 60-second interval, then restored 180 seconds.
 The model service was absent after both successful samples; one between-sample
 app reading was 0.0% CPU and 99,376 KiB RSS. The footer showed
-check times and fixed skip/processing reasons. Test entries, images and the
+check times and fixed skip/processing reasons. The final selector was also
+verified on a real app with a 1728×32 toolbar above its 1728×1084 content window:
+capture plus fast OCR took about 0.50 seconds and recognized 1,164 characters.
+Only dimensions, character counts and duration were inspected. The signed app
+then saved a new completed real-work entry; only its completion status and
+timestamp were checked, and the model service had exited. Test entries, images and the
 fixture app were removed. No real screen content was printed or exported.
 
 `make check` covers stopped-by-default sessions, idle/busy/sleep gates, stale
 session rejection, duplicate hashes, Unicode/input/resource bounds, runtime
 ownership and cancellation with a harmless subprocess and fake readiness,
-small body text through fast OCR, summary-only storage/migration, bounded day
+toolbar/transparent-window selection and private-window ordering, small body
+text through fast OCR, summary-only storage/migration, bounded day
 reads, and a private-pasteboard
 round-trip. It never calls an AI provider. The existing dictation/provider/
 shortcut tests also pass. No new live microphone-to-paste claim is made;
